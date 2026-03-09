@@ -488,68 +488,109 @@ docker stop wid-sor-2
 
 ## Market Crash Performance Results
 
-Actual results from running Scenario 3 on a single dev machine (4 containerized instances):
+Actual results from running Scenario 3 on a single dev machine (4 containerized instances, no CPU/memory limits):
 
 ```
 ═══════════════════════════════════════════════════════
 WID SOR Performance Test Report
 ═══════════════════════════════════════════════════════
 Scenario:                    Market Crash (2M alerts, 4 instances)
-Duration:                    2 minutes 37 seconds
+Duration:                    2 minutes 16 seconds
+Send phase:                  2 minutes 16 seconds
 Total webhooks sent:         2,000,000
-Total alerts processed:      1,065,252
-Total alerts skipped:        934,748 (inactive: 0, throttled: 934,748, not found: 0)
+Total alerts processed:      1,263,809
+Total alerts skipped:        736,191 (inactive: 0, throttled: 736,191, not found: 0)
 Total alerts failed:         0
-Network/HTTP errors:         0
+Network/HTTP errors:         0 (send) + 0 (http)
 
 Webhook Response Time:
-  P50:                       822.96 ms
-  P95:                       1033.05 ms
-  P99:                       1343.34 ms
+  P50:                       659.62 ms
+  P95:                       891.59 ms
+  P99:                       1323.44 ms
+  Max:                       3154.43 ms
 
 Orchestration Throughput:
-  Avg:                       6,785 /sec (across 4 instances)
-  Per instance avg:          1,696 /sec
-  Peak send rate:            23,671 /sec
-  Avg orchestration time:    3.33 ms
+  Avg:                       9,293 /sec (across 4 instances)
+  Per instance avg:          2,323 /sec
+  Peak send rate:            26,787 /sec
+  Avg orchestration time:    4.01 ms
 
 Thread Pool:
+  Peak queue depth:          0 (at query time)
   CallerRunsPolicy count:    0
+  Peak active threads:       0 (at query time)
 
 MongoDB:
-  Avg lookup time:           1.21 ms
-  Avg update time:           1.58 ms
-  Total ops:                 3,065,252
+  Avg lookup time:           1.42 ms
+  Avg update time:           1.85 ms
+  Total ops:                 3,263,809
 
 Market Data:
-  Cache hit ratio:           96.1%
-  Cache hits:                1,023,691
-  Cache misses:              41,561
-  Avg fetch time (miss):     3.55 ms
+  Cache hit ratio:           96.8%
+  Cache hits:                1,223,698
+  Cache misses:              40,111
+  Avg fetch time (miss):     3.32 ms
 
 Kafka:
-  Messages published:        1,065,252
-  Avg publish time:          2.24 ms
+  Messages published:        1,263,809
+  Avg publish time:          2.14 ms
+
+CPU (sampled every 2s):
+  System CPU (host):
+    Avg:                     55.2%
+    Peak:                    100.0%
+  Process CPU (per JVM):
+    Instance 1:              avg 6.1%, peak 19.3%
+    Instance 2:              avg 6.1%, peak 18.2%
+    Instance 3:              avg 6.0%, peak 18.1%
+    Instance 4:              avg 6.2%, peak 19.5%
+    Overall avg:             6.1%
+    Overall peak:            19.5%
+  Samples collected:         276
+
+Memory:
+  Load generator heap:       1,548 MB
 ═══════════════════════════════════════════════════════
 ```
 
 ### Interpreting the Results
 
-**2M webhooks processed in 2 minutes 37 seconds with zero failures.**
+**2M webhooks processed in 2 minutes 16 seconds with zero failures.**
 
 | Metric | Result | Notes |
 |--------|--------|-------|
-| Total time | 2m 37s | Well under the 15-min target |
-| Throughput | 6,785/sec aggregate | 1,696/sec per instance |
-| Alerts processed | 1,065,252 | Remaining 934,748 correctly throttled |
+| Total time | 2m 16s | Well under the 15-min target |
+| Throughput | 9,293/sec aggregate | 2,323/sec per instance |
+| Alerts processed | 1,263,809 | Remaining 736,191 correctly throttled |
 | Alerts failed | 0 | Zero data loss, zero errors |
 | CallerRunsPolicy | 0 | Thread pool queue never overflowed |
-| Cache hit ratio | 96.1% | 41K HTTP calls instead of 1M+ |
-| Avg orchestration | 3.33 ms | MongoDB + market data + Kafka combined |
+| Cache hit ratio | 96.8% | 40K HTTP calls instead of 1.2M+ |
+| Avg orchestration | 4.01 ms | MongoDB + market data + Kafka combined |
+| System CPU avg | 55.2% | Host machine average across all containers |
+| System CPU peak | 100% | Host saturated at peak (shared with load generator, MongoDB, Kafka) |
+| Per-JVM CPU avg | 6.1% | Each WID SOR instance is lightweight |
+| Per-JVM CPU peak | 19.5% | Brief spikes during high-throughput windows |
 
-**Why 934K were throttled**: The test builds 2M payloads by sampling from ~1.4M eligible targets. Many targets get sampled multiple times. After the first webhook for a given customer+trigger sets `dateDelivered`, all subsequent webhooks for the same target within the same day are correctly throttled. This is the deduplication logic working exactly as designed.
+**Why 736K were throttled**: The test builds 2M payloads by sampling from ~1.4M eligible targets. Many targets get sampled multiple times. After the first webhook for a given customer+trigger sets `dateDelivered`, all subsequent webhooks for the same target within the same day are correctly throttled. This is the deduplication logic working exactly as designed.
 
-**Why webhook response times show ~800ms P50**: The load generator pushed 12,688 req/sec with a 10K in-flight semaphore — the high response times reflect **client-side queuing** in the semaphore, not server latency. The actual webhook handler dispatch (accept + enqueue to thread pool) averaged 0.03ms. The server was never the bottleneck.
+**Why webhook response times show ~660ms P50**: The load generator pushed ~14,600 req/sec with a 10K in-flight semaphore — the high response times reflect **client-side queuing** in the semaphore, not server latency. The actual webhook handler dispatch (accept + enqueue to thread pool) averaged sub-millisecond. The server was never the bottleneck.
+
+### CPU Analysis
+
+The test sampled `process.cpu.usage` and `system.cpu.usage` from each JVM instance every 2 seconds via the Micrometer actuator endpoint (276 total samples across 4 instances).
+
+**Per-JVM CPU is low (~6% avg)** because each orchestration is I/O-bound (MongoDB lookup → market data fetch → Kafka publish), not compute-bound. The 200-thread pool spends most of its time waiting on network I/O, not burning CPU cycles.
+
+**Host CPU hit 100% at peak** because the Docker host was shared between all containers — the 4 WID SOR instances, MongoDB, Kafka, Zookeeper, and the load generator itself (200 sender threads + 10K async HTTP connections). In a production OCP cluster with dedicated nodes, each component would have isolated CPU resources.
+
+**CPU breakdown on the shared host:**
+| Component | Estimated CPU Share | Why |
+|-----------|-------------------|-----|
+| Load generator | ~25-30% | 200 sender threads, HTTP connection management, response time tracking |
+| MongoDB | ~15-20% | 3.2M total ops (1.2M lookups + 1.2M updates + throttle checks) |
+| 4× WID SOR JVMs | ~24% total (~6% each) | Thread pool orchestration, JSON serialization, Kafka producer |
+| Kafka | ~5-10% | 1.2M messages, LZ4 compression, log writes |
+| Other (Zookeeper, mock market data, OS) | ~5% | Minimal |
 
 ## Key Design Decisions
 
@@ -695,6 +736,367 @@ flowchart TB
 | **Total** | **24 cores** | **46 GB** | **190 GB SSD** | |
 
 These numbers are for handling a 2M-alert market crash event. For normal operations, the cluster is significantly over-provisioned — which is the point: you size for the worst case so the system absorbs shock without degradation.
+
+## OpenShift (OCP) Deployment
+
+### CPU Behavior: Throttling vs. OOMKill
+
+A common concern: **will pods die if CPU hits 100%?** No. OCP/Kubernetes handles CPU and memory limits differently:
+
+| Resource | What happens at limit | Pod survives? |
+|----------|----------------------|---------------|
+| **Memory** | OOMKilled — kernel terminates the process immediately | **No** — pod restarts |
+| **CPU** | Throttled — kernel CFS scheduler reduces CPU cycles | **Yes** — pod slows down but stays alive |
+
+When a pod exceeds its CPU **limit**, the Linux CFS (Completely Fair Scheduler) throttles the process — it simply gets fewer CPU cycles in each scheduling period. The pod stays alive, but latency increases.
+
+When a pod exceeds its CPU **request** (but is under its limit), the pod runs at full speed as long as the node has spare capacity. Requests are **guarantees**, limits are **ceilings**.
+
+### The Real Risk: Latency Degradation
+
+CPU throttling doesn't kill pods, but it degrades performance in a predictable chain:
+
+```mermaid
+flowchart TD
+    A["CPU throttled\n(limit exceeded)"] --> B["Orchestration time increases\n(3ms → 20ms+)"]
+    B --> C["Thread pool threads\nstay busy longer"]
+    C --> D["Queue fills up\n(50K capacity)"]
+    D --> E{"Queue full?"}
+    E -- Yes --> F["CallerRunsPolicy activates\n→ HTTP thread processes alert\n→ webhook response time spikes"]
+    E -- No --> G["Latency rises\nbut system stays stable"]
+    F --> H["FactSet sees timeouts\n(if response > 30s)"]
+    G --> I["Alerts still processed\njust slower"]
+```
+
+**Observed in testing**: Even with the Docker host at 100% system CPU, the WID SOR pods (at ~6% avg / 19.5% peak per JVM) never triggered CallerRunsPolicy — there was no queue backup. This means the current 4-instance setup has significant CPU headroom for production.
+
+### Recommended OCP Resource Configuration
+
+```yaml
+# deployment.yaml for WID SOR
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wid-sor-alert-service
+spec:
+  replicas: 4    # adjusted by CronJob/KEDA based on market hours
+  template:
+    spec:
+      containers:
+        - name: wid-sor
+          resources:
+            requests:
+              cpu: "1"        # guaranteed 1 core per pod
+              memory: "2Gi"   # guaranteed 2 GB
+            limits:
+              cpu: "2"        # can burst to 2 cores
+              memory: "3Gi"   # hard ceiling — OOMKill above this
+          env:
+            - name: JAVA_OPTS
+              value: "-Xmx2g -Xms2g -XX:MaxMetaspaceSize=128m -XX:+UseG1GC -XX:MaxGCPauseMillis=50"
+```
+
+#### Why `requests.cpu: 1` / `limits.cpu: 2`
+
+- **Request = 1 core**: The Kubernetes scheduler guarantees 1 core is always available. At 6% avg CPU observed in testing, this is more than sufficient for normal and busy day scenarios.
+- **Limit = 2 cores**: During market crash peaks (19.5% observed, could be higher under larger datasets), the pod can burst to 2 cores. If the node has spare capacity, it runs at full speed. If not, CFS throttles — but the pod survives.
+- **No limit (burstable alternative)**: Omit `limits.cpu` entirely to let pods use all available node CPU. This maximizes throughput but risks noisy-neighbor problems if other workloads share the node.
+
+#### Why `limits.memory: 3Gi` (hard ceiling)
+
+- JVM heap: 2 GB (`-Xmx2g`)
+- Metaspace: ~100 MB
+- Native memory (thread stacks, NIO buffers): ~200-400 MB
+- OS overhead: ~200 MB
+- Total: ~2.7 GB typical, 3 GB ceiling
+- **Exceeding this = OOMKill** — the JVM process is terminated and the pod restarts. This is why memory limits must account for non-heap memory, not just `-Xmx`.
+
+### Market Hours Scaling Strategy
+
+Market crashes only happen during trading hours. There's no reason to keep crash-ready capacity at 2 AM. The recommended approach is **proactive pre-scaling for market hours + reactive HPA for burst**.
+
+#### Why HPA Alone Isn't Enough
+
+HPA is **reactive** — it responds to observed CPU load. During a market crash at 9:31 AM:
+1. HPA detects CPU > 70% (~15 seconds for metrics to propagate)
+2. HPA decides to scale (30-second stabilization window)
+3. New pods start (JVM startup: ~15-30 seconds)
+4. New pods become ready (readiness probe: ~15 seconds)
+
+**Total cold-start gap: 60-90 seconds** of degraded throughput while running on only 2 pods. Pre-scaling eliminates this.
+
+#### Market Hours Schedule
+
+```mermaid
+flowchart LR
+    subgraph "Off-Hours (8:00 PM → 9:15 AM ET)"
+        OH["2 pods\n(minimum capacity)\n~100/sec"]
+    end
+    subgraph "Pre-Market Warmup (9:15 AM ET)"
+        PM["Scale to 4 pods\n(crash-ready)\npods warm before 9:30 open"]
+    end
+    subgraph "Market Hours (9:30 AM → 4:00 PM ET)"
+        MH["4 pods baseline\nHPA can burst to 8\n~9,300-18,500/sec"]
+    end
+    subgraph "Post-Market (4:05 PM ET)"
+        AM["Scale to 2 pods\n(save resources)\nHPA min overridden"]
+    end
+    OH --> PM --> MH --> AM --> OH
+```
+
+| Time Window | Pods | CPU per Pod | Ready For | Cost (cores) |
+|-------------|------|-------------|-----------|-------------|
+| Off-hours (8 PM – 9:15 AM ET) | 2 | ~3% idle | Overnight batch, low volume | 2 cores |
+| Pre-market warmup (9:15 AM ET) | 4 | ~3% idle | Pods warm, caches primed | 4 cores |
+| Market hours (9:30 AM – 4 PM ET) | 4-8 | 6-35% | Normal day through market crash | 4-8 cores |
+| Post-market (4:05 PM ET) | 2 | ~3% | After-hours trickle | 2 cores |
+
+**15 minutes early** at 9:15 AM gives the new pods time to:
+- Complete JVM startup and class loading
+- Pass readiness probes
+- Warm the Caffeine cache (first few webhooks populate it)
+- Establish MongoDB and Kafka connections
+
+#### Option 1: CronJob + `oc scale` (Simplest)
+
+```yaml
+# Pre-market scale-up: 9:15 AM ET (14:15 UTC during EST, 13:15 UTC during EDT)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: wid-sor-market-open-scaler
+spec:
+  schedule: "15 14 * * 1-5"    # Mon-Fri 9:15 AM EST (adjust for EDT)
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: wid-sor-scaler  # needs scale permissions
+          containers:
+            - name: scaler
+              image: registry.redhat.io/openshift4/ose-cli:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  oc scale deployment/wid-sor-alert-service --replicas=4
+                  oc patch hpa/wid-sor-hpa -p '{"spec":{"minReplicas":4}}'
+          restartPolicy: OnFailure
+---
+# Post-market scale-down: 4:05 PM ET (21:05 UTC during EST, 20:05 UTC during EDT)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: wid-sor-market-close-scaler
+spec:
+  schedule: "5 21 * * 1-5"    # Mon-Fri 4:05 PM EST (adjust for EDT)
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: wid-sor-scaler
+          containers:
+            - name: scaler
+              image: registry.redhat.io/openshift4/ose-cli:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  oc patch hpa/wid-sor-hpa -p '{"spec":{"minReplicas":2}}'
+                  # HPA will gradually scale down to 2 based on low CPU
+          restartPolicy: OnFailure
+---
+# RBAC: allow the scaler service account to manage deployments and HPAs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wid-sor-scaler-role
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wid-sor-scaler-binding
+subjects:
+  - kind: ServiceAccount
+    name: wid-sor-scaler
+roleRef:
+  kind: Role
+  name: wid-sor-scaler-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**Note on EST/EDT**: CronJob schedules use the cluster's timezone (typically UTC). Market hours are Eastern Time, which shifts between EST (UTC-5) and EDT (UTC-4). Either adjust the CronJob schedules twice a year, or use KEDA (Option 2) which handles timezone-aware cron expressions.
+
+#### Option 2: KEDA (Recommended for Production)
+
+KEDA (Kubernetes Event-Driven Autoscaler) is available as an OCP Operator. It supports **cron-based scaling as a first-class trigger** combined with metric-based scaling — no separate CronJobs needed.
+
+```yaml
+# Install KEDA Operator first:
+# OCP Console → OperatorHub → "KEDA" → Install
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: wid-sor-scaled
+spec:
+  scaleTargetRef:
+    name: wid-sor-alert-service
+  minReplicaCount: 2        # absolute minimum (off-hours)
+  maxReplicaCount: 8        # absolute maximum (market crash)
+  triggers:
+    # Cron trigger: pre-scale to 4 during market hours (Mon-Fri)
+    - type: cron
+      metadata:
+        timezone: America/New_York        # handles EST/EDT automatically
+        start: "15 9 * * 1-5"            # 9:15 AM ET Mon-Fri
+        end: "5 16 * * 1-5"              # 4:05 PM ET Mon-Fri
+        desiredReplicas: "4"             # guaranteed 4 pods during market hours
+    # CPU trigger: burst beyond 4 pods if load spikes
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "70"                      # scale up when avg CPU > 70%
+```
+
+**Why KEDA over CronJob:**
+- **Timezone-aware**: `America/New_York` handles EST/EDT transitions automatically — no manual schedule updates
+- **Single resource**: Combines time-based and metric-based scaling in one `ScaledObject` instead of CronJobs + HPA
+- **Smooth transitions**: KEDA manages the scale-down gradually, respecting cooldown periods
+- **Additional triggers**: Can add Kafka consumer lag, Prometheus metrics, or custom queries as future scaling signals
+
+#### KEDA Scaling Timeline (Market Crash Day)
+
+```mermaid
+gantt
+    title WID SOR Pod Scaling — Market Crash Day
+    dateFormat HH:mm
+    axisFormat %H:%M
+
+    section Pods
+    2 pods (off-hours)           :done, 00:00, 09:15
+    4 pods (KEDA cron pre-scale) :active, 09:15, 09:31
+    6 pods (KEDA CPU burst)      :crit, 09:31, 10:15
+    4 pods (load subsides)       :active, 10:15, 16:05
+    2 pods (KEDA cron off-hours) :done, 16:05, 23:59
+```
+
+### Horizontal Pod Autoscaler (HPA)
+
+If using the CronJob approach (Option 1), deploy this HPA alongside the CronJobs. If using KEDA (Option 2), the `ScaledObject` replaces this HPA.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: wid-sor-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: wid-sor-alert-service
+  minReplicas: 2            # overridden to 4 by CronJob during market hours
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70    # scale up when avg CPU > 70% of request
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30   # react quickly to market crash
+      policies:
+        - type: Pods
+          value: 2                      # add up to 2 pods at a time
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300  # wait 5 min before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+```
+
+#### Scaling Summary
+
+```mermaid
+flowchart TD
+    subgraph "Off-Hours (8 PM → 9:15 AM ET)"
+        OH["2 pods minimum\nHPA min = 2"]
+    end
+    subgraph "9:15 AM ET — CronJob/KEDA"
+        PRE["Scale to 4 pods\nHPA min → 4\nJVM warm-up begins"]
+    end
+    subgraph "Market Hours (9:30 AM → 4:00 PM ET)"
+        MH["4 pods baseline"]
+        MH --> SPIKE{"CPU > 70%?"}
+        SPIKE -- Yes --> BURST["HPA/KEDA adds pods\nup to 8 max"]
+        SPIKE -- No --> STABLE["4 pods, steady"]
+        BURST --> RECOVER["Load drops\n5 min cooldown\nscale back to 4"]
+    end
+    subgraph "4:05 PM ET — CronJob/KEDA"
+        POST["HPA min → 2\nGradual scale-down"]
+    end
+    OH --> PRE --> MH
+    STABLE --> POST
+    RECOVER --> POST
+
+```
+
+| Time | Trigger | Pods | Throughput Capacity | Monthly Cost Impact |
+|------|---------|------|--------------------|--------------------|
+| Off-hours | CronJob/KEDA cron | 2 | ~4,600/sec | Baseline |
+| 9:15 AM ET | CronJob/KEDA cron | 4 | ~9,300/sec | +2 pods × 6.75 hrs |
+| Market crash | HPA/KEDA CPU | 6-8 | ~14,000-18,500/sec | +2-4 pods (minutes to hours) |
+| 4:05 PM ET | CronJob/KEDA cron | 2 | ~4,600/sec | Back to baseline |
+
+**Savings**: Running 2 pods off-hours instead of 4 saves ~50% of WID SOR compute cost for 17.25 hours/day (off-hours) — roughly **36% overall cost reduction** versus running 4 pods 24/7.
+
+### Liveness and Readiness Probes
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  initialDelaySeconds: 30      # JVM startup time
+  periodSeconds: 10
+  failureThreshold: 3          # 3 failures = restart pod
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 5
+  failureThreshold: 3          # 3 failures = remove from service
+```
+
+**Liveness** restarts the pod if the JVM is unresponsive (deadlock, OOM, GC death spiral). **Readiness** removes the pod from the load balancer during startup or if MongoDB/Kafka connections are unhealthy — FactSet webhooks are routed only to ready pods.
+
+### Test Environment vs. Production
+
+The load test ran on a single Docker host with all containers sharing CPU and memory — no resource limits, no isolation. The results reflect a worst-case shared environment:
+
+| Aspect | Docker Test Environment | OCP Production |
+|--------|------------------------|----------------|
+| CPU isolation | None — all containers share host | Per-pod guarantees via `requests` |
+| Memory limits | None — JVM `-Xmx` only | Pod-level `limits.memory` enforced by kernel |
+| Node count | 1 (shared) | Multiple dedicated nodes |
+| System CPU at peak | 100% (host saturated) | Per-node; pods throttled individually |
+| Observed per-JVM CPU | 6.1% avg / 19.5% peak | Expected similar with dedicated resources |
+| Network | Docker bridge (localhost) | OCP SDN (cluster network) — slightly higher latency |
+| Storage | Shared host disk | Dedicated PVs for MongoDB, Kafka |
+
+Despite the shared environment hitting 100% system CPU, the WID SOR instances processed 2M webhooks in 2m16s with zero failures. In OCP with dedicated resources, performance would be equal or better.
 
 ## Project Structure
 
