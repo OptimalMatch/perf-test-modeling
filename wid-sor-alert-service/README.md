@@ -561,6 +561,141 @@ Kafka:
 6. **Eastern Time throttle** — one alert per security per alert type per day, using `America/New_York` timezone (market hours).
 7. **MongoDB `_id` lookup + `$elemMatch`** — fastest possible query path: primary key lookup + array element match on subscriptions.
 
+## Resource Sizing Recommendations
+
+### WID SOR Instances (OpenShift Pods)
+
+Sizing is driven by the thread pool and in-memory cache. Each instance runs a JVM with 200 max threads, each handling a short-lived orchestration (~3.3ms avg). The main memory consumers are the thread pool stacks, the Caffeine cache (~5,000 market data entries), and Kafka producer buffers.
+
+#### Per-Instance Sizing
+
+| Resource | Normal Day | Busy Day | Market Crash | Rationale |
+|----------|-----------|----------|--------------|-----------|
+| **CPU** | 0.5 cores | 1 core | 2 cores | Thread pool drives CPU; 200 threads doing ~3ms work each need ~1-2 cores to avoid context-switch overhead |
+| **Memory (heap)** | 512 MB | 1 GB | 2 GB | Caffeine cache (~5K entries × ~1KB each = ~5MB), thread stacks (200 × 1MB = 200MB), Kafka buffers (32MB), plus headroom for GC |
+| **Memory (pod limit)** | 768 MB | 1.5 GB | 3 GB | Heap + metaspace (~100MB) + native memory + OS overhead; set pod limit ~1.5x heap |
+
+**JVM flags recommendation:**
+```bash
+# Normal/Busy day
+-Xmx1g -Xms512m -XX:MaxMetaspaceSize=128m
+
+# Market crash (high throughput)
+-Xmx2g -Xms2g -XX:MaxMetaspaceSize=128m -XX:+UseG1GC -XX:MaxGCPauseMillis=50
+```
+
+Pinning `-Xms` = `-Xmx` for the crash scenario avoids heap resizing under load.
+
+#### Instance Count Scaling
+
+```mermaid
+flowchart LR
+    subgraph "Normal Day (100 alerts/5 min)"
+        N["1-2 instances\n0.5 CPU / 768 MB each"]
+    end
+    subgraph "Busy Day (10K alerts/5 min)"
+        B["2 instances\n1 CPU / 1.5 GB each"]
+    end
+    subgraph "Market Crash (2M alerts ASAP)"
+        C["4+ instances\n2 CPU / 3 GB each"]
+    end
+```
+
+| Scenario | Instances | CPU Total | Memory Total | Expected Throughput |
+|----------|-----------|-----------|-------------|---------------------|
+| Normal day | 1-2 | 1 core | 1.5 GB | ~100/sec (trivial) |
+| Busy day | 2 | 2 cores | 3 GB | ~3,400/sec |
+| Market crash | 4 | 8 cores | 12 GB | ~6,800/sec |
+| Market crash (aggressive) | 8 | 16 cores | 24 GB | ~13,000/sec (projected) |
+
+Throughput scales roughly linearly with instance count because the bottleneck is per-instance thread pool capacity, not shared infrastructure (MongoDB and Kafka both handled 4 instances easily in testing).
+
+### MongoDB
+
+MongoDB sizing depends on the `customers` collection size and query pattern. WID SOR only does two operations: `_id` lookup (read) and `$elemMatch` + `$set` update (write). Both use the primary key index.
+
+| Resource | 500K Customers | 2M Customers | 5M Customers |
+|----------|---------------|-------------|-------------|
+| **Storage** | ~2 GB | ~8 GB | ~20 GB |
+| **RAM (WiredTiger cache)** | 2 GB | 4 GB | 8 GB |
+| **CPU** | 2 cores | 4 cores | 8 cores |
+
+Key considerations:
+- **Working set should fit in RAM** — WiredTiger cache should hold the full `customers` collection; if it spills to disk, `_id` lookups go from ~1ms to ~10ms+
+- **Avg document size** is ~1-2 KB (customer info + 2-8 subscriptions at ~100 bytes each)
+- **Write concern**: the `dateDelivered` update is a single-field `$set` on an indexed path — lightweight, but at 6,800 writes/sec during a crash, MongoDB needs enough write throughput
+- **Replica set** recommended for production (not required for prototype); secondary reads are not useful since WID always needs the latest `dateDelivered`
+
+```
+Storage estimate:  500K docs × ~1.5 KB avg = ~750 MB data + indexes (~250 MB) ≈ 1 GB on disk
+                   With WiredTiger compression (snappy): ~500 MB on disk
+```
+
+### Kafka
+
+WID SOR is a **publish-only** client — it does not consume from Kafka. The topic `wid-customer-alerts` is owned by DSP.
+
+| Resource | Recommendation | Rationale |
+|----------|---------------|-----------|
+| **Partitions** | 12 | Keyed by `customerId`; 12 partitions allows up to 12 DSP consumer threads |
+| **Broker CPU** | 2 cores | Handling ~6,800 msgs/sec at ~1 KB each is modest for Kafka |
+| **Broker memory** | 4 GB | Page cache for log segments |
+| **Broker disk** | Depends on retention | At ~6,800 msgs/sec × 1 KB × 3600 sec = ~24 GB/hour; set retention based on DSP consumption lag |
+| **Replication factor** | 3 (production) | Standard for durability; prototype uses 1 |
+
+**Producer tuning** (already configured in `application.yml`):
+- `acks=all` — wait for all in-sync replicas (durability over speed)
+- `linger.ms=5` — batch for 5ms to improve throughput
+- `compression-type=lz4` — reduces network I/O with minimal CPU cost
+- `batch-size=16384` — 16KB batches
+
+### Market Data Service
+
+The Caffeine cache absorbs most of the load. The upstream market data service only sees cache misses.
+
+| Scenario | Cache Misses (HTTP calls) | Peak RPS to Market Data | Notes |
+|----------|--------------------------|------------------------|-------|
+| Normal day | ~30-50 | < 1/sec | Negligible |
+| Busy day | ~500-1,000 | ~10/sec | Easily handled |
+| Market crash | ~41,000 | ~300/sec peak (first 30s), then ~70/sec | First 30-second window is the burst; once cache is warm, only TTL expirations cause misses |
+
+The 30-second TTL means: during a sustained crash event lasting 10 minutes, each symbol is fetched ~20 times total (10 min / 30 sec) × 4 instances = ~80 calls per symbol across the cluster. For 2,000 symbols: ~160K total HTTP calls over 10 minutes, or ~267/sec average.
+
+### Summary: Production Sizing for Market Crash Readiness
+
+```mermaid
+flowchart TB
+    subgraph WID ["WID SOR (4 pods)"]
+        direction LR
+        P1["Pod 1\n2 CPU / 3 GB"]
+        P2["Pod 2\n2 CPU / 3 GB"]
+        P3["Pod 3\n2 CPU / 3 GB"]
+        P4["Pod 4\n2 CPU / 3 GB"]
+    end
+    subgraph MDB ["MongoDB"]
+        M1[("Primary\n4 CPU / 8 GB\n+ 2 secondaries")]
+    end
+    subgraph KFK ["Kafka"]
+        K1["3 brokers\n2 CPU / 4 GB each\n12 partitions, RF=3"]
+    end
+    subgraph MDS ["Market Data Service"]
+        MD1["Capacity: 500 RPS\n(cache absorbs 96%+)"]
+    end
+    WID --> MDB
+    WID --> KFK
+    WID --> MDS
+```
+
+| Component | CPU | Memory | Storage | Count |
+|-----------|-----|--------|---------|-------|
+| WID SOR pod | 2 cores | 3 GB | — | 4 |
+| MongoDB | 4 cores | 8 GB | 20 GB SSD | 1 primary + 2 secondaries |
+| Kafka broker | 2 cores | 4 GB | 50 GB SSD | 3 |
+| Market Data | 2 cores | 2 GB | — | 2 (HA) |
+| **Total** | **24 cores** | **46 GB** | **190 GB SSD** | |
+
+These numbers are for handling a 2M-alert market crash event. For normal operations, the cluster is significantly over-provisioned — which is the point: you size for the worst case so the system absorbs shock without degradation.
+
 ## Project Structure
 
 ```
