@@ -2,6 +2,7 @@ package com.bank.moo.service;
 
 import com.bank.moo.model.*;
 import com.bank.moo.repository.CustomerRepository;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,8 +43,10 @@ class MOOAlertOrchestrationServiceTest {
     @BeforeEach
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
+        CircuitBreakerRegistry circuitBreakerRegistry = CircuitBreakerRegistry.ofDefaults();
         service = new MOOAlertOrchestrationService(
-                customerRepository, mongoTemplate, marketDataClient, kafkaTemplate, meterRegistry);
+                customerRepository, mongoTemplate, marketDataClient, kafkaTemplate,
+                meterRegistry, circuitBreakerRegistry);
         ReflectionTestUtils.setField(service, "kafkaTopic", "moo-customer-alerts");
     }
 

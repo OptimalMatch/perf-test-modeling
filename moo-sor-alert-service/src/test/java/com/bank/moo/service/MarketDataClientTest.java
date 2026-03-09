@@ -2,6 +2,7 @@ package com.bank.moo.service;
 
 import com.bank.moo.mock.MockMarketDataServer;
 import com.bank.moo.model.MarketData;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.*;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -30,7 +31,8 @@ class MarketDataClientTest {
     @BeforeEach
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
-        client = new MarketDataClient(meterRegistry);
+        CircuitBreakerRegistry circuitBreakerRegistry = CircuitBreakerRegistry.ofDefaults();
+        client = new MarketDataClient(meterRegistry, circuitBreakerRegistry);
         ReflectionTestUtils.setField(client, "baseUrl", "http://localhost:18081");
         ReflectionTestUtils.setField(client, "cacheMaxSize", 5000);
         ReflectionTestUtils.setField(client, "cacheTtlSeconds", 30);

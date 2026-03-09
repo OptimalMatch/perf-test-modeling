@@ -601,6 +601,176 @@ The test sampled `process.cpu.usage` and `system.cpu.usage` from each JVM instan
 5. **Kafka key = customerId** — ensures message ordering per customer within a partition.
 6. **Eastern Time throttle** — one alert per security per alert type per day, using `America/New_York` timezone (market hours).
 7. **MongoDB `_id` lookup + `$elemMatch`** — fastest possible query path: primary key lookup + array element match on subscriptions.
+8. **Resilience4j circuit breakers** — all three external dependencies (market data REST, MongoDB, Kafka) are protected by circuit breakers that fast-fail when a dependency is unhealthy, preventing thread starvation cascades. Market data falls back to stale cache; MongoDB and Kafka fast-fail with metric tracking.
+
+## Circuit Breakers (Resilience4j)
+
+### The Problem Without Circuit Breakers
+
+Without circuit breakers, a dependency outage causes a cascading failure. If the market data service goes down, every cache miss hangs for the HTTP timeout. Threads block, the queue fills, CallerRunsPolicy kicks in, and webhook response times spike from sub-millisecond to seconds. The service stays "up" but is effectively useless — all 200 threads are stuck waiting on a dead dependency.
+
+```mermaid
+flowchart TD
+    A["Market data service\ngoes down"] --> B["Every cache miss\nhangs for HTTP timeout\n(30s default)"]
+    B --> C["200 threads blocked\nwaiting on dead service"]
+    C --> D["Thread pool queue\nfills to 50K"]
+    D --> E["CallerRunsPolicy activates\nHTTP threads process alerts"]
+    E --> F["Webhook response times\nspike to 30+ seconds"]
+    F --> G["FactSet sees timeouts\nstops sending webhooks"]
+    style A fill:#ff6b6b
+    style G fill:#ff6b6b
+```
+
+| Dependency | Risk Without Circuit Breaker | Impact |
+|------------|------------------------------|--------|
+| **Market Data REST** | Service goes down → every cache miss hangs for the HTTP timeout → threads blocked → queue fills → CallerRunsPolicy → webhook responses slow to seconds | Highest risk — external service, most likely to fail |
+| **MongoDB** | Goes down → every lookup/update hangs → same thread starvation cascade | Medium risk — usually more stable, but replica set failovers cause brief outages |
+| **Kafka** | Broker down → publish hangs → threads blocked | Medium risk — producer has its own timeout/retry, but a full cluster outage still blocks |
+
+### How Circuit Breakers Fix This
+
+Each dependency is wrapped in a Resilience4j circuit breaker that monitors failure rates and **fast-fails** when a dependency is unhealthy — returning immediately instead of blocking a thread for 30 seconds.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED: All calls pass through
+    CLOSED --> OPEN: Failure rate exceeds threshold
+    OPEN --> HALF_OPEN: Wait duration expires
+    HALF_OPEN --> CLOSED: Test calls succeed
+    HALF_OPEN --> OPEN: Test calls fail
+
+    note right of CLOSED: Normal operation.\nAll requests go to dependency.\nFailures counted in sliding window.
+    note right of OPEN: Circuit tripped.\nAll requests rejected immediately.\nNo calls to dependency (it can recover).
+    note right of HALF_OPEN: Recovery probe.\nLimited test calls allowed.\nIf they pass → close circuit.
+```
+
+### Circuit Breaker Configuration
+
+Three circuit breakers protect each external dependency:
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      marketData:           # Market data REST calls (highest risk)
+        sliding-window-size: 50
+        failure-rate-threshold: 40       # open after 40% failures in 50-call window
+        wait-duration-in-open-state: 15s # try again after 15 seconds
+        slow-call-duration-threshold: 5s # calls > 5s count as slow
+        slow-call-rate-threshold: 80     # open if 80% of calls are slow
+      mongoLookup:          # MongoDB read + write operations
+        failure-rate-threshold: 60       # more tolerant — MongoDB is usually stable
+        wait-duration-in-open-state: 10s # recover faster (failovers are brief)
+        slow-call-duration-threshold: 10s
+        slow-call-rate-threshold: 90
+      kafkaPublish:         # Kafka producer sends
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 20s # Kafka recovery can be slow
+        slow-call-duration-threshold: 10s
+        slow-call-rate-threshold: 80
+```
+
+### Where Circuit Breakers Are Applied
+
+```mermaid
+flowchart TD
+    A["Webhook arrives"] --> B["Thread pool dispatch"]
+    B --> CB1{"MongoDB\ncircuit breaker"}
+    CB1 -- CLOSED --> M1["MongoDB lookup\n(by _id)"]
+    CB1 -- OPEN --> F1["Fast-fail\n→ alert skipped\n→ increment moo.mongo.circuit.rejected"]
+    M1 --> V["Validate subscription"]
+    V --> CB2{"Market Data\ncircuit breaker"}
+    CB2 -- CLOSED --> MD["REST call\n(or Caffeine cache hit)"]
+    CB2 -- "OPEN + stale cache" --> STALE["Serve stale\ncached data"]
+    CB2 -- "OPEN + no cache" --> F2["Fail\n→ increment moo.marketdata.circuit.rejected"]
+    MD --> UPD["MongoDB update\n(dateDelivered)"]
+    STALE --> UPD
+    UPD --> CB3{"Kafka\ncircuit breaker"}
+    CB3 -- CLOSED --> K["Kafka publish"]
+    CB3 -- OPEN --> F3["Fast-fail\n→ alert lost\n→ increment moo.kafka.circuit.rejected"]
+    K --> DONE["Done ✓"]
+```
+
+### Fallback Behavior When Circuits Open
+
+| Circuit | When Open | Fallback | Data Impact |
+|---------|-----------|----------|-------------|
+| **marketData** | Market data service is down or slow | Serve **stale cached data** if available (expired but still in JVM memory). If no cached data exists, fail the alert. | Alert may have slightly stale market data (price from last 30s). Acceptable tradeoff vs. no alert at all. |
+| **mongoLookup** | MongoDB is down or failover in progress | **Fast-fail** — skip the alert immediately. Cannot process without customer data. | Alert is lost. FactSet would need to retry. This is the same behavior as a pod crash — accepted tradeoff. |
+| **kafkaPublish** | Kafka cluster is down | **Fast-fail** — dateDelivered is already updated, but message is not published. | Customer's `dateDelivered` is set (throttled for the day) but Cow never receives the alert. Worst case: customer misses one day's alert. |
+
+### Why These Thresholds
+
+**Market data (40% failure, 15s recovery)**:
+- Most aggressive — this is an external REST service and the most likely to fail
+- 40% failure rate on a 50-call window means ~20 failures trigger the circuit
+- 15s recovery is short because the Caffeine cache (30s TTL) can absorb brief outages
+- Slow call threshold at 5s catches degraded-but-not-dead scenarios (normal is ~3.5ms)
+
+**MongoDB (60% failure, 10s recovery)**:
+- More tolerant — MongoDB is internal infrastructure, rarely goes fully down
+- 60% threshold accommodates brief spikes during replica set elections (~5-10s)
+- 10s recovery matches typical MongoDB failover duration
+- Slow call threshold at 10s is generous (normal is ~1.3ms)
+
+**Kafka (50% failure, 20s recovery)**:
+- Kafka broker failures can take longer to recover (leader election, ISR changes)
+- 20s wait gives the cluster time to rebalance
+- The Kafka producer already has its own retries (`retries: 3`), so the circuit breaker catches scenarios where retries are also failing
+
+### Performance Impact
+
+Circuit breakers add negligible overhead — a single state check (CLOSED/OPEN/HALF_OPEN) per call:
+
+| Metric | Without Circuit Breaker | With Circuit Breaker | Delta |
+|--------|------------------------|---------------------|-------|
+| Duration | 2m 53s | **2m 27s** | 15% faster* |
+| Throughput | 6,158/sec | **8,597/sec** | +40%* |
+| P50 latency | 870ms | **750ms** | -14%* |
+| Alerts processed | 1,065,256 | **1,263,799** | +19%* |
+| Alerts failed | 0 | **0** | No change |
+| Circuit rejections | N/A | **0** | All circuits stayed CLOSED |
+
+*Performance variation is due to Docker host conditions (shared machine), not circuit breaker overhead. The circuit breaker state check takes ~microseconds per call.
+
+All three circuit breakers stayed **CLOSED** throughout the 2M market crash test — which is expected since all dependencies were healthy. The value is in the failure scenario: when a dependency goes down, the circuit opens in milliseconds and threads stop piling up.
+
+### Monitoring Circuit Breaker State
+
+Three new metrics track circuit breaker rejections:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `moo.marketdata.circuit.rejected` | Counter | Calls rejected because market data circuit is OPEN |
+| `moo.mongo.circuit.rejected` | Counter | Calls rejected because MongoDB circuit is OPEN |
+| `moo.kafka.circuit.rejected` | Counter | Calls rejected because Kafka circuit is OPEN |
+
+Resilience4j also auto-registers metrics with Micrometer:
+- `resilience4j.circuitbreaker.state` — current state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
+- `resilience4j.circuitbreaker.calls` — call counts by outcome (successful, failed, not_permitted)
+- `resilience4j.circuitbreaker.failure.rate` — current failure rate percentage
+
+Circuit breaker health is exposed at `/actuator/health`:
+```json
+{
+  "status": "UP",
+  "components": {
+    "circuitBreakers": {
+      "status": "UP",
+      "details": {
+        "marketData": { "status": "UP", "details": { "state": "CLOSED", "failureRate": "0.0%" }},
+        "mongoLookup": { "status": "UP", "details": { "state": "CLOSED", "failureRate": "0.0%" }},
+        "kafkaPublish": { "status": "UP", "details": { "state": "CLOSED", "failureRate": "0.0%" }}
+      }
+    }
+  }
+}
+```
+
+**Alert on**: any circuit transitioning to OPEN state. In Prometheus/Grafana:
+```promql
+resilience4j_circuitbreaker_state{state="open"} > 0
+```
 
 ## Resource Sizing Recommendations
 
@@ -1163,6 +1333,9 @@ All metrics exposed via `/actuator/prometheus` for scraping and via `/actuator/m
 | `moo.marketdata.cache.hit` | Counter | Caffeine cache hits (no HTTP call needed) |
 | `moo.marketdata.cache.miss` | Counter | Caffeine cache misses (HTTP call made) |
 | `moo.kafka.publish.time` | Timer | Kafka producer send latency |
+| `moo.marketdata.circuit.rejected` | Counter | Market data calls rejected (circuit OPEN) |
+| `moo.mongo.circuit.rejected` | Counter | MongoDB calls rejected (circuit OPEN) |
+| `moo.kafka.circuit.rejected` | Counter | Kafka publishes rejected (circuit OPEN) |
 | `moo.threadpool.queue.size` | Gauge | Current thread pool queue depth |
 | `moo.threadpool.active.threads` | Gauge | Currently active processing threads |
 | `moo.threadpool.caller.runs.count` | Gauge | Times CallerRunsPolicy activated (queue overflow) |

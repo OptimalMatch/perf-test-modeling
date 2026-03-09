@@ -2,6 +2,9 @@ package com.bank.moo.service;
 
 import com.bank.moo.model.*;
 import com.bank.moo.repository.CustomerRepository;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -21,6 +24,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 @Service
@@ -34,11 +38,16 @@ public class MOOAlertOrchestrationService {
     private final MarketDataClient marketDataClient;
     private final KafkaTemplate<String, CowAlertMessage> kafkaTemplate;
 
+    private final CircuitBreaker mongoCircuitBreaker;
+    private final CircuitBreaker kafkaCircuitBreaker;
+
     private final Counter processedCounter;
     private final Counter skippedInactiveCounter;
     private final Counter skippedThrottledCounter;
     private final Counter skippedNotFoundCounter;
     private final Counter failedCounter;
+    private final Counter mongoCircuitOpenCounter;
+    private final Counter kafkaCircuitOpenCounter;
     private final Timer orchestrationTimer;
     private final Timer mongoLookupTimer;
     private final Timer mongoUpdateTimer;
@@ -52,17 +61,23 @@ public class MOOAlertOrchestrationService {
             MongoTemplate mongoTemplate,
             MarketDataClient marketDataClient,
             KafkaTemplate<String, CowAlertMessage> kafkaTemplate,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            CircuitBreakerRegistry circuitBreakerRegistry) {
         this.customerRepository = customerRepository;
         this.mongoTemplate = mongoTemplate;
         this.marketDataClient = marketDataClient;
         this.kafkaTemplate = kafkaTemplate;
+
+        this.mongoCircuitBreaker = circuitBreakerRegistry.circuitBreaker("mongoLookup");
+        this.kafkaCircuitBreaker = circuitBreakerRegistry.circuitBreaker("kafkaPublish");
 
         this.processedCounter = meterRegistry.counter("moo.alert.processed");
         this.skippedInactiveCounter = meterRegistry.counter("moo.alert.skipped.inactive");
         this.skippedThrottledCounter = meterRegistry.counter("moo.alert.skipped.throttled");
         this.skippedNotFoundCounter = meterRegistry.counter("moo.alert.skipped.not_found");
         this.failedCounter = meterRegistry.counter("moo.alert.failed");
+        this.mongoCircuitOpenCounter = meterRegistry.counter("moo.mongo.circuit.rejected");
+        this.kafkaCircuitOpenCounter = meterRegistry.counter("moo.kafka.circuit.rejected");
         this.orchestrationTimer = meterRegistry.timer("moo.orchestration.time");
         this.mongoLookupTimer = meterRegistry.timer("moo.mongo.lookup.time");
         this.mongoUpdateTimer = meterRegistry.timer("moo.mongo.update.time");
@@ -76,9 +91,21 @@ public class MOOAlertOrchestrationService {
 
     private void processAlert(String userId, FactSetAlert alert) {
         try {
-            // Step 1: Lookup customer by _id
-            CustomerDocument customer = mongoLookupTimer.record(() ->
-                    customerRepository.findById(userId).orElse(null));
+            // Step 1: Lookup customer by _id (circuit-breaker protected)
+            CustomerDocument customer;
+            try {
+                Supplier<CustomerDocument> decoratedLookup = CircuitBreaker.decorateSupplier(
+                        mongoCircuitBreaker, () ->
+                                mongoLookupTimer.record(() ->
+                                        customerRepository.findById(userId).orElse(null))
+                );
+                customer = decoratedLookup.get();
+            } catch (CallNotPermittedException e) {
+                mongoCircuitOpenCounter.increment();
+                failedCounter.increment();
+                log.debug("MongoDB circuit OPEN, skipping alert for userId={}", userId);
+                return;
+            }
 
             if (customer == null) {
                 log.debug("Customer not found for userId={}", userId);
@@ -94,7 +121,7 @@ public class MOOAlertOrchestrationService {
 
             Subscription subscription = eligibleSub.get();
 
-            // Step 3: Fetch market data (cached)
+            // Step 3: Fetch market data (cached, with its own circuit breaker)
             MarketData marketData = marketDataClient.getMarketData(alert.getSymbol());
             if (marketData == null) {
                 log.warn("Market data unavailable for symbol={}", alert.getSymbol());
@@ -103,17 +130,45 @@ public class MOOAlertOrchestrationService {
             }
 
             // Step 4: Update dateDelivered BEFORE publishing to Kafka
-            mongoUpdateTimer.record(() -> updateDateDelivered(userId, alert.getTriggerId()));
+            // Uses the same mongo circuit breaker
+            try {
+                Supplier<Void> decoratedUpdate = CircuitBreaker.decorateSupplier(
+                        mongoCircuitBreaker, () -> {
+                            mongoUpdateTimer.record(() -> updateDateDelivered(userId, alert.getTriggerId()));
+                            return null;
+                        }
+                );
+                decoratedUpdate.get();
+            } catch (CallNotPermittedException e) {
+                mongoCircuitOpenCounter.increment();
+                failedCounter.increment();
+                log.warn("MongoDB circuit OPEN during dateDelivered update for userId={}", userId);
+                return;
+            }
 
-            // Step 5: Build and publish to Kafka
+            // Step 5: Build and publish to Kafka (circuit-breaker protected)
             CowAlertMessage message = buildCowMessage(customer, subscription, alert, marketData);
-            kafkaPublishTimer.record(() -> {
-                try {
-                    kafkaTemplate.send(kafkaTopic, customer.getCustomerId(), message).get();
-                } catch (Exception e) {
-                    throw new RuntimeException("Kafka publish failed", e);
-                }
-            });
+            try {
+                Supplier<Void> decoratedPublish = CircuitBreaker.decorateSupplier(
+                        kafkaCircuitBreaker, () -> {
+                            kafkaPublishTimer.record(() -> {
+                                try {
+                                    kafkaTemplate.send(kafkaTopic, customer.getCustomerId(), message).get();
+                                } catch (Exception e) {
+                                    throw new RuntimeException("Kafka publish failed", e);
+                                }
+                            });
+                            return null;
+                        }
+                );
+                decoratedPublish.get();
+            } catch (CallNotPermittedException e) {
+                kafkaCircuitOpenCounter.increment();
+                failedCounter.increment();
+                log.warn("Kafka circuit OPEN, alert processed but not published for customerId={}",
+                        customer.getCustomerId());
+                return;
+            }
 
             processedCounter.increment();
             log.debug("Alert processed: customerId={}, triggerId={}", customer.getCustomerId(), alert.getTriggerId());

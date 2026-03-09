@@ -3,6 +3,9 @@ package com.bank.moo.service;
 import com.bank.moo.model.MarketData;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -14,6 +17,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 @Service
 public class MarketDataClient {
@@ -24,6 +28,8 @@ public class MarketDataClient {
     private final Timer fetchTimer;
     private final Counter cacheHitCounter;
     private final Counter cacheMissCounter;
+    private final Counter circuitOpenCounter;
+    private final CircuitBreaker circuitBreaker;
 
     @Value("${moo.market-data.base-url:http://localhost:8081}")
     private String baseUrl;
@@ -36,10 +42,12 @@ public class MarketDataClient {
 
     private Cache<String, MarketData> cache;
 
-    public MarketDataClient(MeterRegistry meterRegistry) {
+    public MarketDataClient(MeterRegistry meterRegistry, CircuitBreakerRegistry circuitBreakerRegistry) {
         this.fetchTimer = meterRegistry.timer("moo.marketdata.fetch.time");
         this.cacheHitCounter = meterRegistry.counter("moo.marketdata.cache.hit");
         this.cacheMissCounter = meterRegistry.counter("moo.marketdata.cache.miss");
+        this.circuitOpenCounter = meterRegistry.counter("moo.marketdata.circuit.rejected");
+        this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("marketData");
     }
 
     @PostConstruct
@@ -51,6 +59,7 @@ public class MarketDataClient {
     }
 
     public MarketData getMarketData(String symbol) {
+        // Check cache first — cache is outside the circuit breaker
         MarketData cached = cache.getIfPresent(symbol);
         if (cached != null) {
             cacheHitCounter.increment();
@@ -58,14 +67,39 @@ public class MarketDataClient {
         }
 
         cacheMissCounter.increment();
-        MarketData data = fetchTimer.record(() -> {
-            String url = baseUrl + "/api/v1/marketdata/" + symbol;
-            return restTemplate.getForObject(url, MarketData.class);
-        });
 
-        if (data != null) {
-            cache.put(symbol, data);
+        // Circuit breaker wraps only the HTTP call
+        try {
+            Supplier<MarketData> decoratedSupplier = CircuitBreaker.decorateSupplier(circuitBreaker, () ->
+                    fetchTimer.record(() -> {
+                        String url = baseUrl + "/api/v1/marketdata/" + symbol;
+                        return restTemplate.getForObject(url, MarketData.class);
+                    })
+            );
+
+            MarketData data = decoratedSupplier.get();
+            if (data != null) {
+                cache.put(symbol, data);
+            }
+            return data;
+
+        } catch (CallNotPermittedException e) {
+            // Circuit is OPEN — try to serve stale cached data
+            circuitOpenCounter.increment();
+            MarketData stale = cache.getIfPresent(symbol);
+            if (stale != null) {
+                log.debug("Market data circuit OPEN, serving stale cache for symbol={}", symbol);
+                return stale;
+            }
+            log.warn("Market data circuit OPEN and no cached data for symbol={}", symbol);
+            return null;
+        } catch (Exception e) {
+            log.error("Market data fetch failed for symbol={}: {}", symbol, e.getMessage());
+            return null;
         }
-        return data;
+    }
+
+    public CircuitBreaker getCircuitBreaker() {
+        return circuitBreaker;
     }
 }
