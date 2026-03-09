@@ -1,0 +1,28 @@
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/moo-test
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+moo:
+  market-data:
+    base-url: http://localhost:18081
+    cache:
+      max-size: 5000
+      ttl-seconds: 30
+  kafka:
+    topic: moo-customer-alerts-test
+  thread-pool:
+    core-size: 10
+    max-size: 20
+    queue-capacity: 1000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
