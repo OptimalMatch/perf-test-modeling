@@ -78,6 +78,19 @@ public class MarketCrashLoadTest {
         AtomicLong windowCount = new AtomicLong(0);
         AtomicLong peakPerSec = new AtomicLong(0);
 
+        // CPU sampling - collect process.cpu.usage from all instances every 2 seconds
+        List<double[]> cpuSamples = Collections.synchronizedList(new ArrayList<>());
+        ScheduledExecutorService cpuSampler = Executors.newSingleThreadScheduledExecutor();
+        cpuSampler.scheduleAtFixedRate(() -> {
+            try {
+                for (int inst = 0; inst < BASE_URLS.length; inst++) {
+                    double processCpu = getGauge(healthClient, BASE_URLS[inst], "process.cpu.usage");
+                    double systemCpu = getGauge(healthClient, BASE_URLS[inst], "system.cpu.usage");
+                    cpuSamples.add(new double[]{inst, processCpu, systemCpu, System.currentTimeMillis()});
+                }
+            } catch (Exception e) { /* ignore sampling errors */ }
+        }, 0, 2, TimeUnit.SECONDS);
+
         Semaphore inflight = new Semaphore(10_000); // limit in-flight requests
         Instant testStart = Instant.now();
         windowStart.set(testStart.toEpochMilli());
@@ -147,6 +160,7 @@ public class MarketCrashLoadTest {
         }
 
         Instant sendEnd = Instant.now();
+        cpuSampler.shutdown();
         Duration sendDuration = Duration.between(testStart, sendEnd);
         System.out.printf("  All %,d webhooks sent in %d min %d sec%n",
                 sentCount.get(), sendDuration.toMinutes(), sendDuration.toSecondsPart());
@@ -224,6 +238,40 @@ public class MarketCrashLoadTest {
         long totalMongoOps = totalMongoLookupCount + totalMongoUpdateCount;
         double avgThroughput = totalDuration.getSeconds() > 0 ? (double) totalProcessed / totalDuration.getSeconds() : 0;
 
+        // CPU metrics - aggregate samples per instance and overall
+        double[] peakProcessCpu = new double[BASE_URLS.length];
+        double[] avgProcessCpu = new double[BASE_URLS.length];
+        int[] sampleCounts = new int[BASE_URLS.length];
+        double peakSystemCpu = 0;
+        double totalSystemCpu = 0;
+        int systemCpuCount = 0;
+
+        for (double[] sample : cpuSamples) {
+            int inst = (int) sample[0];
+            double processCpu = sample[1];
+            double systemCpu = sample[2];
+            if (processCpu > peakProcessCpu[inst]) peakProcessCpu[inst] = processCpu;
+            avgProcessCpu[inst] += processCpu;
+            sampleCounts[inst]++;
+            if (systemCpu > peakSystemCpu) peakSystemCpu = systemCpu;
+            totalSystemCpu += systemCpu;
+            systemCpuCount++;
+        }
+
+        double overallPeakProcessCpu = 0;
+        double overallAvgProcessCpu = 0;
+        int instancesWithSamples = 0;
+        for (int i = 0; i < BASE_URLS.length; i++) {
+            if (sampleCounts[i] > 0) {
+                avgProcessCpu[i] /= sampleCounts[i];
+                if (peakProcessCpu[i] > overallPeakProcessCpu) overallPeakProcessCpu = peakProcessCpu[i];
+                overallAvgProcessCpu += avgProcessCpu[i];
+                instancesWithSamples++;
+            }
+        }
+        if (instancesWithSamples > 0) overallAvgProcessCpu /= instancesWithSamples;
+        double avgSystemCpu = systemCpuCount > 0 ? totalSystemCpu / systemCpuCount : 0;
+
         // Memory from JVM running this test (not the service, but useful)
         Runtime rt = Runtime.getRuntime();
         long heapMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
@@ -275,6 +323,19 @@ public class MarketCrashLoadTest {
                   Messages published:        %,d
                   Avg publish time:          %.2f ms
 
+                CPU (sampled every 2s):
+                  System CPU (host):
+                    Avg:                     %.1f%%
+                    Peak:                    %.1f%%
+                  Process CPU (per JVM):
+                    Instance 1:              avg %.1f%%, peak %.1f%%
+                    Instance 2:              avg %.1f%%, peak %.1f%%
+                    Instance 3:              avg %.1f%%, peak %.1f%%
+                    Instance 4:              avg %.1f%%, peak %.1f%%
+                    Overall avg:             %.1f%%
+                    Overall peak:            %.1f%%
+                  Samples collected:         %d
+
                 Memory:
                   Load generator heap:       %,d MB
                 ═══════════════════════════════════════════════════════
@@ -306,6 +367,13 @@ public class MarketCrashLoadTest {
                 avgMarketMs,
                 totalProcessed,
                 avgKafkaMs,
+                avgSystemCpu * 100, peakSystemCpu * 100,
+                avgProcessCpu[0] * 100, peakProcessCpu[0] * 100,
+                avgProcessCpu[1] * 100, peakProcessCpu[1] * 100,
+                avgProcessCpu[2] * 100, peakProcessCpu[2] * 100,
+                avgProcessCpu[3] * 100, peakProcessCpu[3] * 100,
+                overallAvgProcessCpu * 100, overallPeakProcessCpu * 100,
+                cpuSamples.size(),
                 heapMB
         );
 
