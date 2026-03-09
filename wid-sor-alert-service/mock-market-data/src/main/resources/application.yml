@@ -1,0 +1,5 @@
+server:
+  port: 8081
+
+mock:
+  response-delay-ms: ${RESPONSE_DELAY_MS:0}

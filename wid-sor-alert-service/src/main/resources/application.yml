@@ -1,0 +1,50 @@
+spring:
+  application:
+    name: wid-sor-alert-service
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/wid
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      batch-size: 16384
+      buffer-memory: 33554432
+      linger-ms: 5
+      compression-type: lz4
+      properties:
+        max.block.ms: 5000
+
+wid:
+  market-data:
+    base-url: http://localhost:8081
+    cache:
+      max-size: 5000
+      ttl-seconds: 30
+  kafka:
+    topic: wid-customer-alerts
+  thread-pool:
+    core-size: 50
+    max-size: 200
+    queue-capacity: 50000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    tags:
+      application: wid-sor-alert-service
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.bank.wid: INFO
+    org.springframework.kafka: WARN
+    org.mongodb: WARN
