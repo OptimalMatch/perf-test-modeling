@@ -18,6 +18,57 @@ flowchart LR
 - **FactSet** sends one webhook per customer per trigger — if 200K customers subscribe to AAPL 5% drop, FactSet sends 200K separate webhooks; WID does NOT fan out
 - **WID does NOT persist inbound FactSet alerts** — no queue, no raw alert collection; if a pod crashes, in-flight alerts in the thread pool are lost
 
+## Subscription Lifecycle
+
+WID SOR is the **alert orchestration** service — it reads subscriptions and processes alerts, but it does **not** own the subscription CRUD lifecycle. This prototype has no subscription management API.
+
+### How Subscriptions Get Into MongoDB (Production)
+
+```mermaid
+sequenceDiagram
+    participant CX as Customer<br/>(UI/Mobile)
+    participant SUB as Subscription<br/>Management API<br/>(separate service)
+    participant FS as FactSet API
+    participant MDB as MongoDB<br/>(customer SOR)
+    participant WID as WID SOR<br/>(this service)
+
+    CX->>SUB: "Alert me if AAPL drops 5%"
+    SUB->>FS: Register trigger<br/>(symbol=AAPL, type=6, value=-5,<br/>callbackUrl=.../webhook?userId=abc)
+    FS-->>SUB: triggerId = FS-TRIG-88421
+    SUB->>MDB: Add subscription to customer doc<br/>(factSetTriggerId, symbol, value, activeState=Y)
+    Note over MDB: Subscription now exists.<br/>WID SOR can read it.
+    Note over FS: Later, when AAPL drops 5%...
+    FS->>WID: POST /webhook?userId=abc<br/>{triggerId: FS-TRIG-88421, ...}
+    WID->>MDB: Lookup customer + subscription
+    WID->>WID: Validate, enrich, publish
+```
+
+The key points:
+
+1. **A separate subscription management service** handles customer subscribe/unsubscribe requests and writes to MongoDB
+2. **FactSet trigger registration** happens at subscription time — the subscription service registers a trigger with FactSet's API and stores the returned `factSetTriggerId` in the customer document
+3. **The `userId` in the webhook callback URL** is the MongoDB `_id` — FactSet stores this at registration time and includes it in every webhook callback, so WID SOR can do a direct primary key lookup
+4. **WID SOR only reads** — it looks up the subscription, validates eligibility, and processes the alert; it never creates or deletes subscriptions
+
+### How Subscriptions Are Created in This Prototype
+
+Since there is no subscription management API in this prototype, test data is seeded by writing directly to MongoDB via `TestDataGenerator`:
+
+```
+TestDataGenerator → MongoDB (direct bulk insert)
+                    ↓
+               500K customers with pre-existing subscriptions
+               (~1.4M eligible webhook targets across ~2,000 symbols)
+                    ↓
+               Load test sends webhooks referencing those subscriptions
+```
+
+The generator creates realistic data distributions:
+- 2-8 subscriptions per customer (randomized)
+- 80% active (`activeState: "Y"`) / 20% inactive
+- 70% eligible (`dateDelivered: null`) / 30% already delivered today
+- Spread across ~2,000 unique symbols with mixed trigger types
+
 ## Orchestration Flow
 
 When a FactSet webhook arrives at `POST /api/v1/alerts/factset/webhook?userId={mongoObjectId}`:
