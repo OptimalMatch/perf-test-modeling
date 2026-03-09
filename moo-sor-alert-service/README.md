@@ -592,6 +592,217 @@ The test sampled `process.cpu.usage` and `system.cpu.usage` from each JVM instan
 | Kafka | ~5-10% | 1.2M messages, LZ4 compression, log writes |
 | Other (Zookeeper, mock market data, OS) | ~5% | Minimal |
 
+## Processing Architecture: Why Async Pool
+
+Four processing architectures were evaluated for handling FactSet webhooks. The choice affects throughput, durability, crash recovery, and infrastructure requirements.
+
+### The Four Options
+
+#### 1. Synchronous Processing
+
+The simplest approach: process each webhook on the HTTP request thread before returning 200.
+
+```mermaid
+sequenceDiagram
+    participant FS as FactSet
+    participant C as Controller
+    participant MDB as MongoDB
+    participant MD as Market Data
+    participant K as Kafka
+
+    FS->>C: POST /webhook
+    C->>MDB: lookup customer
+    MDB-->>C: customer doc
+    C->>MD: get market data
+    MD-->>C: market data
+    C->>MDB: update dateDelivered
+    C->>K: publish to Kafka
+    K-->>C: ack
+    C-->>FS: 200 OK (after ~6ms)
+```
+
+**Problem**: The webhook response time equals the full orchestration time (~6ms). FactSet sends webhooks sequentially per callback URL, so throughput is limited to ~168/sec per instance. A 2M market crash takes **3.3 hours**.
+
+#### 2. Async Thread Pool (Chosen)
+
+Accept the webhook immediately on the HTTP thread, dispatch processing to a background thread pool.
+
+```mermaid
+sequenceDiagram
+    participant FS as FactSet
+    participant C as Controller
+    participant TP as Thread Pool
+    participant MDB as MongoDB
+    participant MD as Market Data
+    participant K as Kafka
+
+    FS->>C: POST /webhook
+    C-->>FS: 200 OK (immediate, ~0.03ms)
+    C->>TP: enqueue async task
+    TP->>MDB: lookup customer
+    MDB-->>TP: customer doc
+    TP->>MD: get market data
+    MD-->>TP: market data
+    TP->>MDB: update dateDelivered
+    TP->>K: publish to Kafka
+    K-->>TP: ack
+```
+
+**Advantage**: Decouples ingest rate from processing rate. The webhook handler returns in microseconds, so ingest rate is limited only by HTTP connection handling (~8,000/sec per instance). The 200-thread pool processes at ~16,800/sec aggregate across 4 instances.
+
+**Tradeoff**: No durability — if a pod crashes, alerts in the thread pool queue are lost.
+
+#### 3. Kafka Ingest Queue (Not Available)
+
+Write the raw FactSet webhook to a Kafka topic immediately, then consume and process asynchronously.
+
+```mermaid
+sequenceDiagram
+    participant FS as FactSet
+    participant C as Controller
+    participant IK as Kafka<br/>(ingest topic)
+    participant W as Consumer<br/>Worker
+    participant MDB as MongoDB
+    participant K as Kafka<br/>(output topic)
+
+    FS->>C: POST /webhook
+    C->>IK: publish raw alert
+    IK-->>C: ack
+    C-->>FS: 200 OK (~2ms)
+    Note over IK,W: Decoupled — consumer<br/>reads at its own pace
+    IK->>W: poll batch
+    W->>MDB: lookup + update
+    W->>K: publish enriched alert
+```
+
+**Advantage**: Full durability — Kafka retains the raw alert even if consumers crash. Automatic recovery: consumers resume from last committed offset. Backlog is visible in consumer lag metrics.
+
+**Problem**: Not available for this use case. The FactSet webhook flow doesn't have an ingest Kafka topic — Apigee routes HTTP directly to MOO SOR. Adding an ingest topic requires changes to the API gateway layer, which is outside MOO SOR's control.
+
+**Performance**: Kafka ingest adds ~2ms per webhook (producer ack), limiting ingest to ~2,000/sec. Consumer processing depends on partition count and consumer instances.
+
+#### 4. MongoDB Queue
+
+Write the raw webhook to a MongoDB `pending_alerts` collection, then poll and process.
+
+```mermaid
+sequenceDiagram
+    participant FS as FactSet
+    participant C as Controller
+    participant MDB as MongoDB<br/>(pending_alerts)
+    participant W as Worker<br/>(polling)
+    participant K as Kafka
+
+    FS->>C: POST /webhook
+    C->>MDB: insert pending alert
+    MDB-->>C: ack
+    C-->>FS: 200 OK (~1.5ms)
+    Note over MDB,W: Worker polls every<br/>100ms for batches
+    W->>MDB: find + claim batch
+    W->>MDB: lookup customer + update dateDelivered
+    W->>K: publish enriched alert
+    W->>MDB: delete from pending_alerts
+```
+
+**Advantage**: Durability using existing infrastructure — no new systems required. Backlog is visible by counting the `pending_alerts` collection.
+
+**Problem 1 — Duplicate processing risk**: Pod A claims an alert (`PENDING` → `PROCESSING`), publishes to Kafka, then crashes before marking `COMPLETED`. A recovery job resets stale `PROCESSING` alerts back to `PENDING`. Pod B picks it up and publishes again — Cow gets a duplicate.
+
+```mermaid
+sequenceDiagram
+    participant A as Pod A
+    participant MDB as MongoDB
+    participant K as Kafka
+    participant B as Pod B
+    participant R as Recovery Job
+
+    A->>MDB: findAndModify(PENDING → PROCESSING)
+    A->>MDB: lookup customer
+    A->>K: publish to Kafka ✓
+    Note over A: Pod A crashes here<br/>(before marking COMPLETED)
+    Note over MDB: Alert stuck in PROCESSING
+    R->>MDB: Reset stale PROCESSING → PENDING
+    B->>MDB: findAndModify(PENDING → PROCESSING)
+    B->>K: publish to Kafka (DUPLICATE)
+    B->>MDB: mark COMPLETED
+```
+
+Mitigations exist (idempotency keys in the Kafka message, dedup on the Cow consumer side, or a two-phase commit pattern), but they add complexity and shift the problem downstream.
+
+**Problem 2 — MongoDB becomes a single point of failure**: The same MongoDB cluster handles webhook ingestion, queue operations, customer lookups, and dateDelivered updates simultaneously. During a 2M market crash:
+
+```
+Operation                     Rate
+──────────────────────────────────────
+Webhook inserts (ingest):     2,000/sec
+Polling reads (findAndModify): 4,000/sec
+Status updates (→ COMPLETED):  4,000/sec
+Customer lookups (by _id):     4,000/sec
+dateDelivered updates:         4,000/sec
+──────────────────────────────────────
+Total Mongo ops:              ~18,000/sec
+```
+
+Compare this to the async pool approach, which only hits MongoDB for customer lookups + dateDelivered updates:
+
+```
+Operation (async pool)        Rate
+──────────────────────────────────────
+Customer lookups (by _id):     8,600/sec
+dateDelivered updates:         8,600/sec
+──────────────────────────────────────
+Total Mongo ops:              ~17,200/sec (no queue overhead)
+```
+
+The async pool generates similar total ops but **eliminates 3 queue-related operation types** (insert, findAndModify, status update) that create write contention and lock pressure. The queue operations are write-heavy and compete with the customer lookup/update path, degrading both.
+
+### Comparison Summary
+
+```
+                    Sync        Async Pool    Kafka Queue   Mongo Queue
+                                (chosen)      (not avail)
+
+Ingest rate         168/sec     8,000/sec     2,000/sec     2,000/sec
+Process rate        168/sec     16,800/sec    1,680/sec     4,000/sec
+2M alert time       3.3 hrs     2 min         37 min        8-42 min
+Durability          none        none          full          full
+Crash recovery      lost        lost          automatic     manual
+Backlog visible     no          no            yes           yes
+Infra needed        nothing     nothing       Kafka topic   nothing new
+Complexity          low         low           medium        medium
+Mongo load          normal      high burst    normal        very high
+Duplicate risk      none        none          none          possible
+```
+
+### Why Async Pool Was Chosen
+
+```mermaid
+flowchart TD
+    A["Requirement:\n2M alerts in < 15 min"] --> B{"Can we use\nKafka ingest?"}
+    B -- "No — Apigee routes\nHTTP directly to us" --> C{"Need durability?"}
+    C -- "Nice to have,\nnot required" --> D{"Need fastest\nthroughput?"}
+    D -- "Yes — market crash\nis time-critical" --> E["Async Pool\n✓ 8,000/sec ingest\n✓ 2 min for 2M\n✓ No new infrastructure\n✓ Low complexity"]
+    C -- "Required" --> F["Mongo Queue\n(only durable option\nwithout Kafka)"]
+    B -- "Yes" --> G["Kafka Queue\n(best overall if\ntopic is available)"]
+```
+
+**The decision came down to three factors:**
+
+1. **Kafka ingest is not available** — FactSet webhooks arrive via HTTP through Apigee. Adding a Kafka ingest topic requires API gateway changes outside MOO SOR's scope. If it were available, Kafka would be the clear winner (durability + automatic recovery + backlog visibility).
+
+2. **Durability is acceptable to lose** — The business accepts that if a pod crashes, in-flight alerts are lost. FactSet can retry failed webhooks. The alternative (MongoDB queue) adds significant complexity and write load for durability that isn't strictly required.
+
+3. **Throughput is the primary constraint** — During a market crash, 2M alerts need to be processed as fast as possible. Async pool delivers 8,000/sec ingest and 16,800/sec processing — an order of magnitude faster than any other option. Synchronous is 47x slower. Kafka queue would take 37 minutes. MongoDB queue would take 8-42 minutes.
+
+### When to Reconsider
+
+| Trigger | Recommendation |
+|---------|---------------|
+| Kafka ingest topic becomes available | Switch to Kafka queue — best of all worlds (durability, recovery, throughput) |
+| Business requires zero alert loss | Add MongoDB queue as a fallback — write to `pending_alerts` before async dispatch, delete after Kafka publish |
+| Alert volume exceeds 5M per event | Kafka queue with multiple consumer groups — async pool hits JVM memory limits at scale |
+| Regulatory audit requires alert delivery proof | Kafka queue with exactly-once semantics — async pool cannot guarantee delivery |
+
 ## Key Design Decisions
 
 1. **No inbound persistence** — FactSet alerts are not stored in MongoDB. The tradeoff is accepted: if a pod crashes, in-flight alerts in the thread pool are lost. Recovery depends on FactSet retry.
