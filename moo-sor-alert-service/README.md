@@ -944,7 +944,166 @@ Circuit breakers add negligible overhead — a single state check (CLOSED/OPEN/H
 
 *Performance variation is due to Docker host conditions (shared machine), not circuit breaker overhead. The circuit breaker state check takes ~microseconds per call.
 
-All three circuit breakers stayed **CLOSED** throughout the 2M market crash test — which is expected since all dependencies were healthy. The value is in the failure scenario: when a dependency goes down, the circuit opens in milliseconds and threads stop piling up.
+All three circuit breakers stayed **CLOSED** throughout the 2M market crash test — which is expected since all dependencies were healthy. The value is in the failure scenario, demonstrated below.
+
+### Degradation Test: Circuit Breaker in Action
+
+To observe the circuit breaker lifecycle under real degradation, a dedicated test sends 200K webhooks while programmatically stopping and restarting the market data service mid-test.
+
+#### Test Phases
+
+```mermaid
+gantt
+    title Circuit Breaker Degradation Test Timeline
+    dateFormat ss
+    axisFormat %S s
+
+    section Market Data
+    Service UP          :done, 00, 20
+    Service DOWN        :crit, 20, 50
+    Service RESTARTED   :active, 50, 100
+
+    section Circuit Breaker
+    CLOSED              :done, 00, 36
+    OPEN (fast-fail)    :crit, 36, 67
+    HALF_OPEN → CLOSED  :active, 67, 100
+
+    section Cache
+    Warming (misses)    :done, 00, 10
+    Serving hits        :done, 10, 33
+    TTL expires (30s)   :crit, 33, 50
+    Re-warming          :active, 67, 80
+```
+
+#### What Happened
+
+**Phase 1: NORMAL (0-20s)** — All dependencies healthy.
+
+```
+Time    Sent     Processed  Failed  CB Rejected  Cache Hits  Cache Misses
+ 0s         213          0       0            0          0            0
+ 9s      22,250     21,892       0            0     16,491        5,401
+18s      44,500     43,830       0            0     38,272        5,756
+```
+
+Cache warms up: ~5,756 unique symbols seen, 38K cache hits. Zero failures, zero circuit breaker activity.
+
+**Phase 2: DEGRADED (20-50s)** — Market data service stopped at t=20s.
+
+```
+Time    Sent     Processed  Failed  CB Rejected  Cache Hits  Cache Misses
+21s      51,250     50,643       0            0     44,887        5,756
+27s      66,250     65,181       0            0     59,425        5,791
+33s      81,250     74,594       0            0     68,838        5,891  ← TTL expiring
+36s      88,684     75,125  10,183       10,039     69,381       16,279  ← CIRCUIT OPENS
+42s     103,500     75,326  25,664       25,384     69,570       31,513
+48s     118,250     75,331  39,923       39,579     69,575       45,718
+```
+
+Three distinct phases within the degradation:
+
+1. **20-33s**: Service is down but **cache is still warm** — all ~2K symbols are cached from Phase 1. Processing continues normally because every market data request is a cache hit. Cache misses stay flat at ~5,791. The Caffeine cache absorbs the outage completely for 13 seconds.
+
+2. **~33s**: Cache entries start expiring (30s TTL from when they were cached in Phase 1). Cache misses spike. Each miss tries the dead market data service → fails → counts toward the circuit breaker's sliding window.
+
+3. **~36s**: **Circuit breaker OPENS** — failure rate exceeds 40% threshold on the 50-call sliding window. From this point, all cache misses are rejected instantly (microseconds) instead of hanging for the HTTP timeout. `moo.marketdata.circuit.rejected` jumps from 0 to 10,039.
+
+**Key insight**: Without the circuit breaker, those 81K failed calls would each have blocked a thread for ~30s (HTTP timeout). With 200 threads, that means only ~7 calls/sec could be attempted. The entire service would stall. With the circuit breaker, failures are instant and threads remain available for cache-hit requests.
+
+**Phase 3: RECOVERY (50-80s)** — Market data service restarted at t=50s.
+
+```
+Time    Sent     Processed  Failed  CB Rejected  Cache Hits  Cache Misses
+51s     125,500     75,331  46,903       46,545     69,575       52,704
+60s     147,750     75,371  68,352       67,985     69,575       74,148  ← still OPEN
+66s     162,500     76,649  81,279       80,911     69,688       88,240  ← HALF_OPEN probes
+69s     170,000     83,780  81,382       81,014     73,732       91,430  ← CLOSED! Processing resumes
+75s     184,750     97,911  81,382       81,014     87,012       92,281
+78s     192,250    104,994  81,382       81,014     94,084       92,292
+```
+
+1. **50-66s**: Circuit is still OPEN (15s `wait-duration-in-open-state`). Even though the service is back, the circuit breaker doesn't know yet. Rejections continue climbing. This is by design — it prevents hammering a service that just recovered.
+
+2. **~67s**: Circuit transitions to **HALF_OPEN** — allows 10 test calls through. They succeed (market data service is healthy again). Circuit transitions to **CLOSED**.
+
+3. **69s onward**: Full recovery. Processed count climbs rapidly (83K→104K). Cache re-warms. No new circuit rejections (stuck at 81,014). Failed count frozen at 81,382.
+
+**Phase 4: POST-RECOVERY (80-100s)** — Normal processing resumes.
+
+```
+Time    Sent     Processed  Failed  CB Rejected  Cache Hits   Cache Misses
+81s     199,750    111,879  81,382       81,014    100,964       92,297
+84s     200,000    112,345  81,382       81,014    101,430       92,297
+```
+
+All 200K webhooks accounted for. Processing returns to normal rate. Cache hit ratio recovering.
+
+#### Final Results
+
+```
+═══════════════════════════════════════════════════════
+Circuit Breaker Degradation Test Report
+═══════════════════════════════════════════════════════
+Duration:                    1 minute 40 seconds
+Total webhooks sent:         200,000
+Network errors:              0
+
+Alert Outcomes:
+  Processed (Kafka published): 112,345  (56.2%)
+  Failed (dependency error):   81,382   (40.7%)
+  Throttled (dedup):           6,273    (3.1%)
+  Total accounted:             200,000  (100%)
+
+Circuit Breaker Rejections:
+  Market Data (OPEN):          81,014
+  MongoDB (OPEN):              0
+  Kafka (OPEN):                0
+
+Market Data Cache:
+  Cache hits:                  101,430
+  Cache misses:                92,297
+  Hit ratio:                   52.4%
+═══════════════════════════════════════════════════════
+```
+
+#### What the Circuit Breaker Prevented
+
+```mermaid
+flowchart LR
+    subgraph "Without Circuit Breaker"
+        A1["81K cache misses\n× 30s HTTP timeout\n= 200+ thread-minutes\nof blocking"] --> B1["All 200 threads stuck\n~7 calls/sec max\nCallerRunsPolicy activates\nService effectively DOWN"]
+    end
+    subgraph "With Circuit Breaker"
+        A2["81K cache misses\n× ~0.001ms rejection\n= ~0.08 seconds total\nof blocking"] --> B2["Threads stay free\nCache hits still processed\nService stays responsive\nAutomatic recovery at 67s"]
+    end
+```
+
+| Aspect | Without CB | With CB |
+|--------|-----------|---------|
+| Thread blocking per failed call | ~30 seconds (HTTP timeout) | ~0.001ms (instant rejection) |
+| Total thread-time wasted | 200+ thread-minutes | 0.08 seconds |
+| Service during outage | **Completely stalled** — all threads blocked | **Partially operational** — cache hits still processed |
+| CallerRunsPolicy triggered | Yes — webhook responses spike to 30s+ | No — threads never backed up |
+| Recovery | Manual — must wait for all blocked threads to timeout | **Automatic** — circuit closes 15s after service recovers |
+| Alerts processed during degradation | Near zero (threads blocked) | 75K processed (cache-hit alerts still delivered) |
+
+#### Running the Degradation Test
+
+```bash
+# 1. Ensure all containers are running
+docker compose up -d
+
+# 2. Reset dateDelivered and restart instances for fresh metrics
+docker exec moo-mongodb mongosh --quiet moo --eval \
+  'db.customers.updateMany({}, { $set: { "subscriptions.$[].dateDelivered": null } })'
+docker compose restart moo-sor-1 moo-sor-2 moo-sor-3 moo-sor-4
+
+# 3. Run the degradation test
+$JAVA_HOME/bin/java -Xmx2g -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
+  com.bank.moo.load.CircuitBreakerDegradationTest
+```
+
+The test automatically stops and restarts `moo-mock-market-data` via Docker commands. No manual intervention needed.
 
 ### Monitoring Circuit Breaker State
 
