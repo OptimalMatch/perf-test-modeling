@@ -1,0 +1,478 @@
+package com.bank.wid.load;
+
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import org.bson.Document;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
+
+public class MarketCrashLoadTest {
+
+    static final int TOTAL_WEBHOOKS = 2_000_000;
+    static final int SENDER_THREADS = 200;
+    static final int SAMPLE_SIZE = 2_000_000; // response time sample reservoir
+
+    static final String[] BASE_URLS = {
+            "http://localhost:8080",
+            "http://localhost:8082",
+            "http://localhost:8083",
+            "http://localhost:8084"
+    };
+
+    static final String MONGO_URI = "mongodb://localhost:27017";
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("═══════════════════════════════════════════════════════");
+        System.out.println("  WID SOR Market Crash Load Test (2M webhooks)");
+        System.out.println("═══════════════════════════════════════════════════════");
+
+        // Step 1: Wait for all instances to be healthy
+        System.out.println("\n[1/5] Waiting for all WID SOR instances to be healthy...");
+        HttpClient healthClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+        for (String url : BASE_URLS) {
+            waitForHealth(healthClient, url);
+        }
+        System.out.println("  All 4 instances healthy.");
+
+        // Step 2: Load webhook targets from MongoDB
+        System.out.println("\n[2/5] Loading eligible webhook targets from MongoDB...");
+        List<String[]> targets = loadTargets();
+        System.out.printf("  Loaded %,d eligible targets. Building %,d webhook payloads...%n",
+                targets.size(), TOTAL_WEBHOOKS);
+
+        // Build 2M payloads by cycling through targets
+        List<String[]> payloads = new ArrayList<>(TOTAL_WEBHOOKS);
+        Random rng = new Random(42);
+        for (int i = 0; i < TOTAL_WEBHOOKS; i++) {
+            payloads.add(targets.get(rng.nextInt(targets.size())));
+        }
+        System.out.printf("  %,d payloads ready.%n", payloads.size());
+
+        // Step 3: Send webhooks
+        System.out.println("\n[3/5] Sending 2,000,000 webhooks across 4 instances...");
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .executor(Executors.newFixedThreadPool(SENDER_THREADS))
+                .build();
+
+        AtomicLong sentCount = new AtomicLong(0);
+        AtomicLong errorCount = new AtomicLong(0);
+        AtomicLong httpErrorCount = new AtomicLong(0);
+        // Use a reservoir sample for response times (nanos)
+        AtomicLongArray responseTimes = new AtomicLongArray(SAMPLE_SIZE);
+        AtomicLong rtIndex = new AtomicLong(0);
+
+        // Track peak throughput in 1-second windows
+        AtomicLong windowStart = new AtomicLong(0);
+        AtomicLong windowCount = new AtomicLong(0);
+        AtomicLong peakPerSec = new AtomicLong(0);
+
+        Semaphore inflight = new Semaphore(10_000); // limit in-flight requests
+        Instant testStart = Instant.now();
+        windowStart.set(testStart.toEpochMilli());
+
+        for (int i = 0; i < payloads.size(); i++) {
+            String[] p = payloads.get(i);
+            String baseUrl = BASE_URLS[i % BASE_URLS.length];
+            String url = baseUrl + "/api/v1/alerts/factset/webhook?userId=" + p[0];
+            String json = String.format(
+                    "{\"triggerId\":\"%s\",\"triggerTypeId\":\"%s\",\"symbol\":\"%s\",\"value\":\"%s\",\"triggeredAt\":\"%s\"}",
+                    p[1], p[2], p[3], p[4], Instant.now().toString());
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(30))
+                    .build();
+
+            inflight.acquire();
+            long reqStart = System.nanoTime();
+
+            client.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                    .whenComplete((resp, ex) -> {
+                        long elapsed = System.nanoTime() - reqStart;
+                        inflight.release();
+
+                        long idx = rtIndex.getAndIncrement();
+                        if (idx < SAMPLE_SIZE) {
+                            responseTimes.set((int) idx, elapsed);
+                        }
+
+                        if (ex != null) {
+                            errorCount.incrementAndGet();
+                        } else if (resp.statusCode() != 200) {
+                            httpErrorCount.incrementAndGet();
+                        }
+
+                        long s = sentCount.incrementAndGet();
+
+                        // Track peak throughput
+                        long now = System.currentTimeMillis();
+                        long ws = windowStart.get();
+                        long wc = windowCount.incrementAndGet();
+                        if (now - ws >= 1000) {
+                            long peak = peakPerSec.get();
+                            if (wc > peak) peakPerSec.set(wc);
+                            windowStart.set(now);
+                            windowCount.set(0);
+                        }
+
+                        if (s % 100_000 == 0) {
+                            double secs = Duration.between(testStart, Instant.now()).toMillis() / 1000.0;
+                            System.out.printf("  Sent: %,d / %,d  (%.0f/sec, errors: %d, http_errors: %d)%n",
+                                    s, (long) TOTAL_WEBHOOKS, s / secs, errorCount.get(), httpErrorCount.get());
+                        }
+                    });
+        }
+
+        // Wait for all in-flight to complete
+        System.out.println("  All requests submitted. Waiting for in-flight to drain...");
+        for (int i = 0; i < 10_000; i++) {
+            inflight.acquire();
+        }
+        for (int i = 0; i < 10_000; i++) {
+            inflight.release();
+        }
+
+        Instant sendEnd = Instant.now();
+        Duration sendDuration = Duration.between(testStart, sendEnd);
+        System.out.printf("  All %,d webhooks sent in %d min %d sec%n",
+                sentCount.get(), sendDuration.toMinutes(), sendDuration.toSecondsPart());
+
+        // Step 4: Wait for async processing to complete
+        System.out.println("\n[4/5] Waiting for async processing to complete...");
+        waitForProcessing(healthClient, TOTAL_WEBHOOKS, Duration.ofMinutes(15));
+        Instant processEnd = Instant.now();
+        Duration totalDuration = Duration.between(testStart, processEnd);
+
+        // Step 5: Collect metrics and generate report
+        System.out.println("\n[5/5] Collecting metrics and generating report...");
+
+        // Sort response times for percentiles
+        int rtCount = (int) Math.min(rtIndex.get(), SAMPLE_SIZE);
+        long[] sorted = new long[rtCount];
+        for (int i = 0; i < rtCount; i++) {
+            sorted[i] = responseTimes.get(i);
+        }
+        Arrays.sort(sorted);
+
+        // Collect metrics from all instances
+        long totalProcessed = 0, totalInactive = 0, totalThrottled = 0, totalNotFound = 0, totalFailed = 0;
+        long totalReceived = 0;
+        double totalOrchTime = 0; long totalOrchCount = 0;
+        double totalMongoLookupTime = 0; long totalMongoLookupCount = 0;
+        double totalMongoUpdateTime = 0; long totalMongoUpdateCount = 0;
+        double totalKafkaTime = 0; long totalKafkaCount = 0;
+        double totalMarketTime = 0; long totalMarketCount = 0;
+        long totalCacheHits = 0, totalCacheMisses = 0;
+        long maxQueueDepth = 0, maxActiveThreads = 0;
+        long totalCallerRuns = 0;
+
+        for (String url : BASE_URLS) {
+            totalReceived += getCount(healthClient, url, "wid.webhook.received");
+            totalProcessed += getCount(healthClient, url, "wid.alert.processed");
+            totalInactive += getCount(healthClient, url, "wid.alert.skipped.inactive");
+            totalThrottled += getCount(healthClient, url, "wid.alert.skipped.throttled");
+            totalNotFound += getCount(healthClient, url, "wid.alert.skipped.not_found");
+            totalFailed += getCount(healthClient, url, "wid.alert.failed");
+            totalCacheHits += getCount(healthClient, url, "wid.marketdata.cache.hit");
+            totalCacheMisses += getCount(healthClient, url, "wid.marketdata.cache.miss");
+            totalCallerRuns += (long) getGauge(healthClient, url, "wid.threadpool.caller.runs.count");
+
+            double[] orchStats = getTimerStats(healthClient, url, "wid.orchestration.time");
+            totalOrchTime += orchStats[0]; totalOrchCount += (long) orchStats[1];
+
+            double[] mongoLookup = getTimerStats(healthClient, url, "wid.mongo.lookup.time");
+            totalMongoLookupTime += mongoLookup[0]; totalMongoLookupCount += (long) mongoLookup[1];
+
+            double[] mongoUpdate = getTimerStats(healthClient, url, "wid.mongo.update.time");
+            totalMongoUpdateTime += mongoUpdate[0]; totalMongoUpdateCount += (long) mongoUpdate[1];
+
+            double[] kafka = getTimerStats(healthClient, url, "wid.kafka.publish.time");
+            totalKafkaTime += kafka[0]; totalKafkaCount += (long) kafka[1];
+
+            double[] market = getTimerStats(healthClient, url, "wid.marketdata.fetch.time");
+            totalMarketTime += market[0]; totalMarketCount += (long) market[1];
+
+            long qd = (long) getGauge(healthClient, url, "wid.threadpool.queue.size");
+            long at = (long) getGauge(healthClient, url, "wid.threadpool.active.threads");
+            if (qd > maxQueueDepth) maxQueueDepth = qd;
+            if (at > maxActiveThreads) maxActiveThreads = at;
+        }
+
+        long totalSkipped = totalInactive + totalThrottled + totalNotFound;
+        double cacheHitRatio = (totalCacheHits + totalCacheMisses) > 0
+                ? totalCacheHits * 100.0 / (totalCacheHits + totalCacheMisses) : 0;
+
+        double avgOrchMs = totalOrchCount > 0 ? totalOrchTime / totalOrchCount * 1000 : 0;
+        double avgMongoLookupMs = totalMongoLookupCount > 0 ? totalMongoLookupTime / totalMongoLookupCount * 1000 : 0;
+        double avgMongoUpdateMs = totalMongoUpdateCount > 0 ? totalMongoUpdateTime / totalMongoUpdateCount * 1000 : 0;
+        double avgKafkaMs = totalKafkaCount > 0 ? totalKafkaTime / totalKafkaCount * 1000 : 0;
+        double avgMarketMs = totalMarketCount > 0 ? totalMarketTime / totalMarketCount * 1000 : 0;
+        long totalMongoOps = totalMongoLookupCount + totalMongoUpdateCount;
+        double avgThroughput = totalDuration.getSeconds() > 0 ? (double) totalProcessed / totalDuration.getSeconds() : 0;
+
+        // Memory from JVM running this test (not the service, but useful)
+        Runtime rt = Runtime.getRuntime();
+        long heapMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+
+        // Print report
+        String report = String.format("""
+
+                ═══════════════════════════════════════════════════════
+                WID SOR Performance Test Report
+                ═══════════════════════════════════════════════════════
+                Scenario:                    Market Crash (2M alerts, 4 instances)
+                Duration:                    %d minutes %d seconds
+                Send phase:                  %d minutes %d seconds
+                Total webhooks sent:         %,d
+                Total alerts processed:      %,d
+                Total alerts skipped:        %,d (inactive: %,d, throttled: %,d, not found: %,d)
+                Total alerts failed:         %,d
+                Network/HTTP errors:         %,d (send) + %,d (http)
+
+                Webhook Response Time:
+                  P50:                       %.2f ms
+                  P95:                       %.2f ms
+                  P99:                       %.2f ms
+                  Max:                       %.2f ms
+
+                Orchestration Throughput:
+                  Avg:                       %.0f /sec (across 4 instances)
+                  Per instance avg:          %.0f /sec
+                  Peak send rate:            %,d /sec
+                  Avg orchestration time:    %.2f ms
+
+                Thread Pool:
+                  Peak queue depth:          %,d (at query time)
+                  CallerRunsPolicy count:    %,d
+                  Peak active threads:       %,d (at query time)
+
+                MongoDB:
+                  Avg lookup time:           %.2f ms
+                  Avg update time:           %.2f ms
+                  Total ops:                 %,d
+
+                Market Data:
+                  Cache hit ratio:           %.1f%%
+                  Cache hits:                %,d
+                  Cache misses:              %,d
+                  Avg fetch time (miss):     %.2f ms
+
+                Kafka:
+                  Messages published:        %,d
+                  Avg publish time:          %.2f ms
+
+                Memory:
+                  Load generator heap:       %,d MB
+                ═══════════════════════════════════════════════════════
+                """,
+                totalDuration.toMinutes(), totalDuration.toSecondsPart(),
+                sendDuration.toMinutes(), sendDuration.toSecondsPart(),
+                sentCount.get(),
+                totalProcessed,
+                totalSkipped, totalInactive, totalThrottled, totalNotFound,
+                totalFailed,
+                errorCount.get(), httpErrorCount.get(),
+                percentileMs(sorted, 0.50),
+                percentileMs(sorted, 0.95),
+                percentileMs(sorted, 0.99),
+                sorted.length > 0 ? sorted[sorted.length - 1] / 1_000_000.0 : 0,
+                avgThroughput,
+                avgThroughput / 4.0,
+                peakPerSec.get(),
+                avgOrchMs,
+                maxQueueDepth,
+                totalCallerRuns,
+                maxActiveThreads,
+                avgMongoLookupMs,
+                avgMongoUpdateMs,
+                totalMongoOps,
+                cacheHitRatio,
+                totalCacheHits,
+                totalCacheMisses,
+                avgMarketMs,
+                totalProcessed,
+                avgKafkaMs,
+                heapMB
+        );
+
+        System.out.print(report);
+
+        // Write to file
+        try (var writer = new java.io.FileWriter("/tmp/wid-market-crash-report.txt")) {
+            writer.write(report);
+        }
+        System.out.println("Report saved to /tmp/wid-market-crash-report.txt");
+        System.exit(0);
+    }
+
+    static void waitForHealth(HttpClient client, String baseUrl) throws Exception {
+        for (int i = 0; i < 60; i++) {
+            try {
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl + "/actuator/health"))
+                        .timeout(Duration.ofSeconds(2)).GET().build();
+                HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200 && resp.body().contains("UP")) {
+                    System.out.println("  " + baseUrl + " -> UP");
+                    return;
+                }
+            } catch (Exception e) { /* retry */ }
+            Thread.sleep(2000);
+        }
+        throw new RuntimeException("Timeout waiting for " + baseUrl);
+    }
+
+    static List<String[]> loadTargets() {
+        List<String[]> targets = new ArrayList<>();
+        try (MongoClient mongo = MongoClients.create(MONGO_URI)) {
+            MongoDatabase db = mongo.getDatabase("wid");
+            MongoCollection<Document> coll = db.getCollection("customers");
+            for (Document doc : coll.find()) {
+                String userId = doc.getObjectId("_id").toHexString();
+                List<Document> subs = doc.getList("subscriptions", Document.class);
+                if (subs == null) continue;
+                for (Document sub : subs) {
+                    if ("Y".equals(sub.getString("activeState")) && sub.get("dateDelivered") == null) {
+                        targets.add(new String[]{
+                                userId,
+                                sub.getString("factSetTriggerId"),
+                                sub.getString("triggerTypeId"),
+                                sub.getString("symbol"),
+                                sub.getString("value")
+                        });
+                    }
+                }
+            }
+        }
+        return targets;
+    }
+
+    static void waitForProcessing(HttpClient client, long expected, Duration timeout) throws Exception {
+        Instant deadline = Instant.now().plus(timeout);
+        long lastTotal = 0;
+        int staleCount = 0;
+        while (Instant.now().isBefore(deadline)) {
+            long total = 0;
+            for (String url : BASE_URLS) {
+                total += getCount(client, url, "wid.alert.processed");
+                total += getCount(client, url, "wid.alert.skipped.inactive");
+                total += getCount(client, url, "wid.alert.skipped.throttled");
+                total += getCount(client, url, "wid.alert.skipped.not_found");
+                total += getCount(client, url, "wid.alert.failed");
+            }
+            System.out.printf("  Processing: %,d / %,d (%.1f%%)%n", total, expected, total * 100.0 / expected);
+            if (total >= expected * 0.995) {
+                System.out.println("  Processing complete.");
+                return;
+            }
+            if (total == lastTotal) {
+                staleCount++;
+                if (staleCount > 10) {
+                    System.out.println("  Processing stalled. Moving on.");
+                    return;
+                }
+            } else {
+                staleCount = 0;
+            }
+            lastTotal = total;
+            Thread.sleep(3000);
+        }
+        System.out.println("  Timeout. Moving on.");
+    }
+
+    static long getCount(HttpClient client, String baseUrl, String metric) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/actuator/metrics/" + metric))
+                    .timeout(Duration.ofSeconds(3)).GET().build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                String body = resp.body();
+                // Simple parse: find "COUNT" and its value
+                int idx = body.indexOf("\"COUNT\"");
+                if (idx > 0) {
+                    int valIdx = body.indexOf("\"value\"", idx);
+                    if (valIdx > 0) {
+                        int colon = body.indexOf(":", valIdx);
+                        int end = body.indexOf("}", colon);
+                        return (long) Double.parseDouble(body.substring(colon + 1, end).trim());
+                    }
+                }
+            }
+        } catch (Exception e) { /* ignore */ }
+        return 0;
+    }
+
+    static double getGauge(HttpClient client, String baseUrl, String metric) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/actuator/metrics/" + metric))
+                    .timeout(Duration.ofSeconds(3)).GET().build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                String body = resp.body();
+                int idx = body.indexOf("\"VALUE\"");
+                if (idx > 0) {
+                    int valIdx = body.indexOf("\"value\"", idx);
+                    if (valIdx > 0) {
+                        int colon = body.indexOf(":", valIdx);
+                        int end = body.indexOf("}", colon);
+                        return Double.parseDouble(body.substring(colon + 1, end).trim());
+                    }
+                }
+            }
+        } catch (Exception e) { /* ignore */ }
+        return 0;
+    }
+
+    static double[] getTimerStats(HttpClient client, String baseUrl, String metric) {
+        // Returns [totalTime, count]
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/actuator/metrics/" + metric))
+                    .timeout(Duration.ofSeconds(3)).GET().build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                String body = resp.body();
+                double totalTime = 0, count = 0;
+                int ttIdx = body.indexOf("\"TOTAL_TIME\"");
+                if (ttIdx > 0) {
+                    int valIdx = body.indexOf("\"value\"", ttIdx);
+                    int colon = body.indexOf(":", valIdx);
+                    int end = body.indexOf("}", colon);
+                    totalTime = Double.parseDouble(body.substring(colon + 1, end).trim());
+                }
+                int cIdx = body.indexOf("\"COUNT\"");
+                if (cIdx > 0) {
+                    int valIdx = body.indexOf("\"value\"", cIdx);
+                    int colon = body.indexOf(":", valIdx);
+                    int end = body.indexOf("}", colon);
+                    count = Double.parseDouble(body.substring(colon + 1, end).trim());
+                }
+                return new double[]{totalTime, count};
+            }
+        } catch (Exception e) { /* ignore */ }
+        return new double[]{0, 0};
+    }
+
+    static double percentileMs(long[] sorted, double p) {
+        if (sorted.length == 0) return 0;
+        int idx = (int) Math.ceil(p * sorted.length) - 1;
+        idx = Math.max(0, Math.min(idx, sorted.length - 1));
+        return sorted[idx] / 1_000_000.0;
+    }
+}
