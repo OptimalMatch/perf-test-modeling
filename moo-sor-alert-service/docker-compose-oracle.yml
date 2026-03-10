@@ -1,0 +1,65 @@
+version: '3.8'
+
+# Docker Compose overlay for running MOO SOR with Oracle instead of MongoDB.
+# Usage: docker-compose -f docker-compose.yml -f docker-compose-oracle.yml up --build
+#
+# This overrides the MOO SOR instances to use the Oracle profile, pointing them
+# at the Oracle container instead of MongoDB. MongoDB is still started (for the
+# base compose) but won't be used by the service instances.
+
+services:
+  moo-sor-1:
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SPRING_DATASOURCE_URL: jdbc:oracle:thin:@oracle:1521/FREEPDB1
+      SPRING_DATASOURCE_USERNAME: moo
+      SPRING_DATASOURCE_PASSWORD: moo_password
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+    depends_on:
+      - oracle
+      - kafka
+      - mock-market-data
+
+  moo-sor-2:
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SPRING_DATASOURCE_URL: jdbc:oracle:thin:@oracle:1521/FREEPDB1
+      SPRING_DATASOURCE_USERNAME: moo
+      SPRING_DATASOURCE_PASSWORD: moo_password
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+    depends_on:
+      - oracle
+      - kafka
+      - mock-market-data
+
+  moo-sor-3:
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SPRING_DATASOURCE_URL: jdbc:oracle:thin:@oracle:1521/FREEPDB1
+      SPRING_DATASOURCE_USERNAME: moo
+      SPRING_DATASOURCE_PASSWORD: moo_password
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+    depends_on:
+      - oracle
+      - kafka
+      - mock-market-data
+
+  moo-sor-4:
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle
+      SPRING_DATASOURCE_URL: jdbc:oracle:thin:@oracle:1521/FREEPDB1
+      SPRING_DATASOURCE_USERNAME: moo
+      SPRING_DATASOURCE_PASSWORD: moo_password
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+    depends_on:
+      - oracle
+      - kafka
+      - mock-market-data

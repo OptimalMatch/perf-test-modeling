@@ -1,7 +1,6 @@
 package com.bank.moo.service;
 
 import com.bank.moo.model.*;
-import com.bank.moo.repository.CustomerRepository;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
@@ -11,10 +10,6 @@ import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -33,8 +28,7 @@ public class MOOAlertOrchestrationService {
     private static final Logger log = LoggerFactory.getLogger(MOOAlertOrchestrationService.class);
     private static final ZoneId EASTERN = ZoneId.of("America/New_York");
 
-    private final CustomerRepository customerRepository;
-    private final MongoTemplate mongoTemplate;
+    private final CustomerDataService customerDataService;
     private final MarketDataClient marketDataClient;
     private final KafkaTemplate<String, CowAlertMessage> kafkaTemplate;
 
@@ -57,14 +51,12 @@ public class MOOAlertOrchestrationService {
     private String kafkaTopic;
 
     public MOOAlertOrchestrationService(
-            CustomerRepository customerRepository,
-            MongoTemplate mongoTemplate,
+            CustomerDataService customerDataService,
             MarketDataClient marketDataClient,
             KafkaTemplate<String, CowAlertMessage> kafkaTemplate,
             MeterRegistry meterRegistry,
             CircuitBreakerRegistry circuitBreakerRegistry) {
-        this.customerRepository = customerRepository;
-        this.mongoTemplate = mongoTemplate;
+        this.customerDataService = customerDataService;
         this.marketDataClient = marketDataClient;
         this.kafkaTemplate = kafkaTemplate;
 
@@ -91,19 +83,19 @@ public class MOOAlertOrchestrationService {
 
     private void processAlert(String userId, FactSetAlert alert) {
         try {
-            // Step 1: Lookup customer by _id (circuit-breaker protected)
+            // Step 1: Lookup customer by id (circuit-breaker protected)
             CustomerDocument customer;
             try {
                 Supplier<CustomerDocument> decoratedLookup = CircuitBreaker.decorateSupplier(
                         mongoCircuitBreaker, () ->
                                 mongoLookupTimer.record(() ->
-                                        customerRepository.findById(userId).orElse(null))
+                                        customerDataService.findByUserId(userId).orElse(null))
                 );
                 customer = decoratedLookup.get();
             } catch (CallNotPermittedException e) {
                 mongoCircuitOpenCounter.increment();
                 failedCounter.increment();
-                log.debug("MongoDB circuit OPEN, skipping alert for userId={}", userId);
+                log.debug("DB circuit OPEN, skipping alert for userId={}", userId);
                 return;
             }
 
@@ -130,11 +122,10 @@ public class MOOAlertOrchestrationService {
             }
 
             // Step 4: Update dateDelivered BEFORE publishing to Kafka
-            // Uses the same mongo circuit breaker
             try {
                 Supplier<Void> decoratedUpdate = CircuitBreaker.decorateSupplier(
                         mongoCircuitBreaker, () -> {
-                            mongoUpdateTimer.record(() -> updateDateDelivered(userId, alert.getTriggerId()));
+                            mongoUpdateTimer.record(() -> customerDataService.updateDateDelivered(userId, alert.getTriggerId()));
                             return null;
                         }
                 );
@@ -142,7 +133,7 @@ public class MOOAlertOrchestrationService {
             } catch (CallNotPermittedException e) {
                 mongoCircuitOpenCounter.increment();
                 failedCounter.increment();
-                log.warn("MongoDB circuit OPEN during dateDelivered update for userId={}", userId);
+                log.warn("DB circuit OPEN during dateDelivered update for userId={}", userId);
                 return;
             }
 
@@ -213,13 +204,6 @@ public class MOOAlertOrchestrationService {
         log.debug("No matching subscription: customerId={}, triggerId={}", customer.getCustomerId(), alert.getTriggerId());
         skippedNotFoundCounter.increment();
         return Optional.empty();
-    }
-
-    private void updateDateDelivered(String userId, String triggerId) {
-        Query query = new Query(Criteria.where("_id").is(userId)
-                .and("subscriptions").elemMatch(Criteria.where("factSetTriggerId").is(triggerId)));
-        Update update = new Update().set("subscriptions.$.dateDelivered", Instant.now());
-        mongoTemplate.updateFirst(query, update, CustomerDocument.class);
     }
 
     private CowAlertMessage buildCowMessage(CustomerDocument customer, Subscription subscription,
