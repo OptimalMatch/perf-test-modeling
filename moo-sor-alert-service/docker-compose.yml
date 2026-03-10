@@ -117,5 +117,19 @@ services:
       MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
       SERVER_PORT: 8080
 
+  # Oracle Free 23ai for relational comparison testing
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: moo-oracle
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: oracle_sys_password
+      APP_USER: moo
+      APP_USER_PASSWORD: moo_password
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+
 volumes:
   mongo-data:
+  oracle-data:

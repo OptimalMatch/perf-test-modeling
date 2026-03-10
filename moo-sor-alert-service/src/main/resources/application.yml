@@ -1,6 +1,11 @@
 spring:
   application:
     name: moo-sor-alert-service
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration
   data:
     mongodb:
       uri: mongodb://localhost:27017/moo
@@ -84,3 +89,38 @@ logging:
     com.bank.moo: INFO
     org.springframework.kafka: WARN
     org.mongodb: WARN
+
+---
+# Oracle profile - activated with: --spring.profiles.active=oracle
+spring:
+  config:
+    activate:
+      on-profile: oracle
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.mongo.MongoAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.mongo.MongoDataAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.mongo.MongoRepositoriesAutoConfiguration
+  datasource:
+    url: jdbc:oracle:thin:@localhost:1521/FREEPDB1
+    username: moo
+    password: moo_password
+    driver-class-name: oracle.jdbc.OracleDriver
+    hikari:
+      maximum-pool-size: 50
+      minimum-idle: 10
+      connection-timeout: 5000
+      idle-timeout: 300000
+      max-lifetime: 600000
+  jpa:
+    hibernate:
+      ddl-auto: none
+    database-platform: org.hibernate.dialect.OracleDialect
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true

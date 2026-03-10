@@ -1,6 +1,6 @@
 # MOO SOR Alert Service
 
-Market alert orchestration service prototype for bank market alert processing. Receives FactSet webhooks via HTTP POST, validates customer subscriptions against MongoDB, enriches with market data from a REST-based market data service, and publishes enriched messages to a Kafka topic consumed by a downstream team (Cow).
+Market alert orchestration service prototype for bank market alert processing. Receives FactSet webhooks via HTTP POST, validates customer subscriptions against **MongoDB or Oracle** (profile-switchable), enriches with market data from a REST-based market data service, and publishes enriched messages to a Kafka topic consumed by a downstream team (Cow).
 
 ## Architecture
 
@@ -11,8 +11,13 @@ flowchart LR
     MOO --> KF["Kafka Topic\nmoo-customer-alerts"]
     KF --> Cow["Cow\n(not simulated)"]
     MOO --> MG[("MongoDB\ncustomer SOR")]
+    MOO -.-> ORA[("Oracle\n(alternative)")]
     MOO --> MD["Market Data\nREST Service"]
 ```
+
+The database layer is abstracted behind a `CustomerDataService` interface. Spring profiles control which implementation is active:
+- **Default (no profile)**: MongoDB — single document per customer with embedded subscription arrays
+- **`oracle` profile**: Oracle 23ai — normalized relational model (3 tables, one row per subscription)
 
 - **MOO SOR** is the service we build and test — it owns no Kafka topics, only publishes to Cow's `moo-customer-alerts` topic
 - **FactSet** sends one webhook per customer per trigger — if 200K customers subscribe to AAPL 5% drop, FactSet sends 200K separate webhooks; MOO does NOT fan out
@@ -248,6 +253,92 @@ Single collection: `customers`
 }
 ```
 
+## Oracle Table Structure (Alternative)
+
+When running with the `oracle` profile, the same customer data is stored in a normalized relational model across three tables. Each subscription that was an embedded array element in MongoDB becomes **its own row** in Oracle.
+
+### Schema
+
+```sql
+-- One row per customer (mirrors MongoDB _id as PK)
+CREATE TABLE CUSTOMERS (
+    ID              VARCHAR2(24)    PRIMARY KEY,   -- same as MongoDB ObjectId hex
+    CUSTOMER_ID     VARCHAR2(20)    NOT NULL,
+    FIRST_NAME      VARCHAR2(50),
+    LAST_NAME       VARCHAR2(50)
+);
+
+-- One row per alert subscription (normalized from MongoDB embedded array)
+CREATE TABLE CUSTOMER_SUBSCRIPTIONS (
+    ID                  NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    CUSTOMER_ID         VARCHAR2(24)    NOT NULL REFERENCES CUSTOMERS(ID),
+    SYMBOL              VARCHAR2(10)    NOT NULL,
+    FACTSET_TRIGGER_ID  VARCHAR2(20)    NOT NULL,
+    TRIGGER_TYPE_ID     VARCHAR2(5)     NOT NULL,
+    TRIGGER_VALUE       VARCHAR2(10),
+    ACTIVE_STATE        CHAR(1)         NOT NULL,
+    SUBSCRIBED_AT       TIMESTAMP WITH TIME ZONE,
+    DATE_DELIVERED      TIMESTAMP WITH TIME ZONE
+);
+
+-- One row per notification channel per customer
+CREATE TABLE CHANNEL_PREFERENCES (
+    ID              NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    CUSTOMER_ID     VARCHAR2(24)    NOT NULL REFERENCES CUSTOMERS(ID),
+    CHANNEL_TYPE    VARCHAR2(30)    NOT NULL,
+    ENABLED         NUMBER(1)       NOT NULL,
+    PRIORITY        NUMBER(3),
+    ADDRESS         VARCHAR2(100),
+    PHONE_NUMBER    VARCHAR2(20)
+);
+
+-- Indexes for query patterns
+CREATE INDEX IDX_SUB_CUSTOMER_ID ON CUSTOMER_SUBSCRIPTIONS(CUSTOMER_ID);
+CREATE INDEX IDX_SUB_TRIGGER_ID ON CUSTOMER_SUBSCRIPTIONS(FACTSET_TRIGGER_ID);
+CREATE INDEX IDX_CHAN_CUSTOMER_ID ON CHANNEL_PREFERENCES(CUSTOMER_ID);
+```
+
+### Data Volume (500K Customers)
+
+| Table | Rows | Notes |
+|-------|------|-------|
+| `CUSTOMERS` | 500,000 | 1:1 with MongoDB documents |
+| `CUSTOMER_SUBSCRIPTIONS` | ~2,500,000 | 2-8 per customer (avg ~5) |
+| `CHANNEL_PREFERENCES` | ~1,300,000 | 2-3 per customer |
+
+### MongoDB vs Oracle: Data Model Comparison
+
+```
+MongoDB (1 collection, 1 document per customer):
+┌─────────────────────────────────────────┐
+│ { _id: "abc",                           │
+│   customerId: "CUST-001",               │
+│   subscriptions: [                      │  ← embedded array
+│     { symbol: "AAPL", triggerId: ... }, │
+│     { symbol: "MSFT", triggerId: ... }  │
+│   ],                                    │
+│   contactPreferences: {                 │
+│     channels: [ ... ]                   │  ← embedded array
+│   }                                     │
+│ }                                       │
+└─────────────────────────────────────────┘
+  → 1 read by _id returns everything
+  → 1 $elemMatch update modifies subscription in-place
+
+Oracle (3 tables, normalized):
+┌──────────────┐    ┌───────────────────────────┐    ┌─────────────────────┐
+│ CUSTOMERS    │    │ CUSTOMER_SUBSCRIPTIONS     │    │ CHANNEL_PREFERENCES │
+│ ─────────    │    │ ────────────────────────   │    │ ──────────────────  │
+│ ID (PK)      │◄──│ CUSTOMER_ID (FK)           │    │ CUSTOMER_ID (FK)    │──►│
+│ CUSTOMER_ID  │    │ SYMBOL                     │    │ CHANNEL_TYPE        │
+│ FIRST_NAME   │    │ FACTSET_TRIGGER_ID         │    │ ENABLED             │
+│ LAST_NAME    │    │ ACTIVE_STATE               │    │ PRIORITY            │
+│              │    │ DATE_DELIVERED              │    │ ADDRESS             │
+└──────────────┘    └───────────────────────────┘    └─────────────────────┘
+  → 1 read requires JOINs across 3 tables (JPA EAGER fetch)
+  → 1 UPDATE on CUSTOMER_SUBSCRIPTIONS by customer_id + trigger_id
+```
+
 ### Throttle Logic
 
 One alert per security, per alert type, per day (Eastern Time):
@@ -324,31 +415,28 @@ executor.setRejectedExecutionHandler(new CallerRunsPolicy());  // overflow → c
 
 ## Quick Start
 
-### 1. Start Infrastructure
+The service supports two database backends, selected via Spring profile:
+
+| Mode | Profile | Database | Docker Compose |
+|------|---------|----------|---------------|
+| **MongoDB** (default) | none | MongoDB 7.0 | `docker compose up` |
+| **Oracle** | `oracle` | Oracle 23ai Free | `docker compose -f docker-compose.yml -f docker-compose-oracle.yml up` |
+
+### Option A: MongoDB (Default)
+
+#### 1. Start Infrastructure
 
 ```bash
 cd moo-sor-alert-service
-docker compose up -d mongodb kafka zookeeper mock-market-data
+docker compose up --build -d
 ```
 
-Wait ~15 seconds for Kafka to be ready.
+This starts MongoDB, Zookeeper, Kafka, mock market data, and 4 MOO SOR instances.
 
-### 2. Build & Run the Service
-
-```bash
-./gradlew bootRun
-```
-
-The service starts on port 8080.
-
-### 3. Seed Test Data
-
-Run `TestDataGenerator.main()` directly — it takes an optional MongoDB URI and customer count:
+#### 2. Seed Test Data
 
 ```bash
-# Using Java directly (requires compiled test classes):
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-./gradlew compileTestJava
 $JAVA_HOME/bin/java -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
   com.bank.moo.load.TestDataGenerator mongodb://localhost:27017 500000
 ```
@@ -359,6 +447,44 @@ This inserts 500K customer documents into MongoDB with:
 - 80% active / 20% inactive subscriptions
 - 70% eligible (dateDelivered null) / 30% already delivered today
 - ~1.4M total eligible webhook targets
+
+### Option B: Oracle
+
+#### 1. Start Infrastructure with Oracle Overlay
+
+```bash
+cd moo-sor-alert-service
+docker compose -f docker-compose.yml -f docker-compose-oracle.yml up --build -d
+```
+
+This adds an Oracle 23ai Free container and overrides MOO SOR instances to use the `oracle` profile (JPA/HikariCP instead of MongoDB).
+
+**First-time startup**: Oracle takes 30-60 seconds to initialize. The MOO SOR instances may fail to connect initially — restart them after Oracle is ready:
+
+```bash
+# Wait for Oracle to be ready
+until docker exec moo-oracle bash -c "echo 'SELECT 1 FROM DUAL;' | sqlplus -s moo/moo_password@//localhost:1521/FREEPDB1" 2>&1 | grep -q "1"; do sleep 5; done
+
+# Restart instances
+docker restart moo-sor-1 moo-sor-2 moo-sor-3 moo-sor-4
+```
+
+#### 2. Seed Oracle with Test Data
+
+```bash
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+$JAVA_HOME/bin/java -Xmx4g -Xms2g -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
+  com.bank.moo.load.OracleTestDataGenerator
+
+# Or via Gradle:
+./gradlew seedOracle
+```
+
+This creates the 3-table schema and inserts 500K customers with the same data distribution (same random seed) as MongoDB:
+- `CUSTOMERS`: 500,000 rows
+- `CUSTOMER_SUBSCRIPTIONS`: ~2,500,000 rows (one per subscription)
+- `CHANNEL_PREFERENCES`: ~1,300,000 rows (one per channel)
+- Gathers optimizer statistics after loading
 
 ### 4. Send a Test Webhook
 
@@ -402,6 +528,7 @@ flowchart TB
     subgraph docker ["Docker Compose Network"]
         subgraph infra ["Infrastructure"]
             MDB[("MongoDB\n:27017")]
+            ORA[("Oracle 23ai\n:1521")]
             ZK["Zookeeper\n:2181"]
             KFK["Kafka\nINTERNAL :29092\nEXTERNAL :9092"]
             MOCK["Mock Market Data\n:8081"]
@@ -413,7 +540,8 @@ flowchart TB
             W3["moo-sor-3\n:8083"]
             W4["moo-sor-4\n:8084"]
         end
-        W1 & W2 & W3 & W4 --> MDB
+        W1 & W2 & W3 & W4 --> |"default profile"| MDB
+        W1 & W2 & W3 & W4 -.-> |"oracle profile"| ORA
         W1 & W2 & W3 & W4 --> KFK
         W1 & W2 & W3 & W4 --> MOCK
     end
@@ -427,10 +555,14 @@ Kafka uses dual listeners:
 ### Start Everything
 
 ```bash
-docker compose up -d
+# MongoDB mode (default)
+docker compose up --build -d
+
+# Oracle mode
+docker compose -f docker-compose.yml -f docker-compose-oracle.yml up --build -d
 ```
 
-This starts MongoDB, Zookeeper, Kafka, mock market data, and 4 MOO SOR instances.
+The `docker-compose-oracle.yml` overlay sets `SPRING_PROFILES_ACTIVE=oracle` on each MOO SOR instance, pointing them at the Oracle container instead of MongoDB. Both containers are started in either mode, but only one is used by the service.
 
 ## Load Testing
 
@@ -447,27 +579,52 @@ This starts MongoDB, Zookeeper, Kafka, mock market data, and 4 MOO SOR instances
 
 ### Running the Market Crash Scenario (Scenario 3)
 
-```bash
-# 1. Start all infrastructure + 4 instances
-docker compose up -d
+#### MongoDB
 
-# 2. Re-seed fresh test data (resets dateDelivered)
+```bash
+# 1. Start with MongoDB (default)
+docker compose up --build -d
+
+# 2. Seed test data
+./gradlew compileTestJava
 $JAVA_HOME/bin/java -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
   com.bank.moo.load.TestDataGenerator mongodb://localhost:27017 500000
 
 # 3. Run the load test
 $JAVA_HOME/bin/java -Xmx4g -Xms2g -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
   com.bank.moo.load.MarketCrashLoadTest
+
+# Report saved to /tmp/moo-market-crash-report.txt
 ```
 
-The load generator:
-- Reads all eligible targets from MongoDB
-- Builds 2M webhook payloads by sampling from eligible targets
-- Sends via async HTTP with 10K in-flight semaphore across 200 sender threads
-- Round-robins across all 4 MOO SOR instances
-- Waits for async processing to complete
-- Collects metrics from all instances via `/actuator/metrics`
-- Prints a formatted performance report
+#### Oracle
+
+```bash
+# 1. Start with Oracle overlay
+docker compose -f docker-compose.yml -f docker-compose-oracle.yml up --build -d
+
+# 2. Wait for Oracle, restart instances if needed (see Quick Start Option B)
+
+# 3. Seed Oracle
+./gradlew seedOracle
+
+# 4. Restart instances to clear metrics
+docker restart moo-sor-1 moo-sor-2 moo-sor-3 moo-sor-4
+
+# 5. Run the Oracle load test
+./gradlew oracleLoadTest
+
+# Report saved to /tmp/moo-oracle-market-crash-report.txt
+```
+
+Both load generators follow the same pattern:
+- Read all eligible targets from the database (MongoDB or Oracle)
+- Build 2M webhook payloads by sampling from eligible targets
+- Send via async HTTP with 10K in-flight semaphore across 200 sender threads
+- Round-robin across all 4 MOO SOR instances
+- Wait for async processing to complete
+- Collect metrics from all instances via `/actuator/metrics`
+- Print a formatted performance report
 
 ### Scenario 4: Degraded Market Data
 
@@ -553,7 +710,141 @@ Memory:
 ═══════════════════════════════════════════════════════
 ```
 
-### Interpreting the Results
+### Oracle Market Crash Performance Results
+
+Same scenario (2M webhooks, 4 instances, same dev machine) with Oracle 23ai Free as the database backend:
+
+```
+═══════════════════════════════════════════════════════
+MOO SOR Performance Test Report — ORACLE
+═══════════════════════════════════════════════════════
+Database:                    Oracle 23ai Free (FREEPDB1)
+Data model:                  Normalized (3 tables: CUSTOMERS, CUSTOMER_SUBSCRIPTIONS, CHANNEL_PREFERENCES)
+Scenario:                    Market Crash (2M alerts, 4 instances)
+Duration:                    6 minutes 37 seconds
+Send phase:                  6 minutes 13 seconds
+Total webhooks sent:         2,000,000
+Total alerts processed:      880,672
+Total alerts skipped:        509,506 (inactive: 0, throttled: 509,506, not found: 0)
+Total alerts failed:         609,822
+Network/HTTP errors:         0 (send) + 0 (http)
+
+Webhook Response Time:
+  P50:                       995.44 ms
+  P95:                       6330.64 ms
+  P99:                       7558.22 ms
+  Max:                       13302.29 ms
+
+Orchestration Throughput:
+  Avg:                       2,218 /sec (across 4 instances)
+  Per instance avg:          555 /sec
+  Peak send rate:            18,923 /sec
+  Avg orchestration time:    220.30 ms
+
+Thread Pool:
+  Peak queue depth:          0 (at query time)
+  CallerRunsPolicy count:    406,933
+  Peak active threads:       0 (at query time)
+
+Oracle DB (via JPA/HikariCP):
+  Avg lookup time:           224.59 ms   (customer + subscriptions + channels JOIN)
+  Avg update time:           142.62 ms   (UPDATE subscription SET date_delivered)
+  Total ops:                 2,277,818
+  Connection pool size:      50 (HikariCP)
+
+Market Data:
+  Cache hit ratio:           89.3%
+  Cache hits:                788,416
+  Cache misses:              94,931
+  Avg fetch time (miss):     2.53 ms
+
+Kafka:
+  Messages published:        880,672
+  Avg publish time:          1.22 ms
+
+CPU (sampled every 2s):
+  System CPU (host):
+    Avg:                     21.2%
+    Peak:                    100.0%
+  Process CPU (per JVM):
+    Instance 1:              avg 3.2%, peak 29.1%
+    Instance 2:              avg 2.9%, peak 42.6%
+    Instance 3:              avg 3.0%, peak 26.9%
+    Instance 4:              avg 2.8%, peak 22.5%
+    Overall avg:             3.0%
+    Overall peak:            42.6%
+  Samples collected:         748
+
+Memory:
+  Load generator heap:       1,869 MB
+═══════════════════════════════════════════════════════
+```
+
+### MongoDB vs Oracle: Head-to-Head Comparison
+
+| Metric | MongoDB | Oracle | Factor |
+|--------|---------|--------|--------|
+| **Total duration** | 2m 16s | 6m 37s | **2.9x slower** |
+| **Throughput (aggregate)** | 9,293/sec | 2,218/sec | **4.2x lower** |
+| **Per instance throughput** | 2,323/sec | 555/sec | **4.2x lower** |
+| **Alerts processed** | 1,263,809 | 880,672 | 30% fewer |
+| **Alerts failed** | 0 | 609,822 | Connection pool saturation |
+| **CallerRunsPolicy** | 0 | 406,933 | Thread pool overwhelmed |
+| **P50 response** | 660ms | 995ms | 1.5x |
+| **P99 response** | 1,323ms | 7,558ms | **5.7x** |
+| **DB lookup time** | 1.42ms | **224.59ms** | **158x slower** |
+| **DB update time** | 1.85ms | **142.62ms** | **77x slower** |
+| **Avg orchestration time** | 4.01ms | 220.30ms | **55x slower** |
+| **Kafka publish** | 2.14ms | 1.22ms | Similar |
+| **Cache hit ratio** | 96.8% | 89.3% | Lower due to slower processing |
+| **Per-JVM CPU** | 6.1% avg | 3.0% avg | I/O bound waiting on Oracle |
+
+### Why Oracle Is Slower for This Workload
+
+**1. Read path: JOIN vs embedded document**
+
+MongoDB returns the entire customer document (subscriptions + channels) in a **single `_id` lookup** (~1.4ms). The document is stored contiguously — one disk seek, one network round trip.
+
+Oracle must JOIN across 3 tables with JPA EAGER fetching:
+```sql
+SELECT c.*, s.*, ch.*
+FROM CUSTOMERS c
+LEFT JOIN CUSTOMER_SUBSCRIPTIONS s ON c.ID = s.CUSTOMER_ID
+LEFT JOIN CHANNEL_PREFERENCES ch ON c.ID = ch.CUSTOMER_ID
+WHERE c.ID = ?
+```
+This involves 3 index lookups, row assembly, and Hibernate entity hydration — **224ms avg** under load. With 500K customers × ~5 subscriptions × ~2.6 channels, the JOINs produce ~7.6 rows per customer that Hibernate must map to objects.
+
+**2. Write path: positional update vs row update**
+
+MongoDB's `$elemMatch` + positional `$set` updates a single field within an embedded array element in-place (~1.85ms). No row locking, no transaction overhead.
+
+Oracle's `UPDATE CUSTOMER_SUBSCRIPTIONS SET DATE_DELIVERED = ? WHERE CUSTOMER_ID = ? AND FACTSET_TRIGGER_ID = ?` requires a row lock, index seek, redo log write, and commit — **142ms avg** under contention with 200 concurrent threads competing for 50 HikariCP connections.
+
+**3. Connection pool bottleneck**
+
+MongoDB's driver maintains a connection pool that handles multiplexing natively. Each of the 200 thread pool threads can issue requests without blocking on connection acquisition.
+
+Oracle with HikariCP has a fixed pool of 50 connections. When all 50 are busy with slow queries (224ms lookups), the remaining 150 threads block waiting for a connection. This caused:
+- **609K failures** — likely HikariCP connection acquisition timeouts
+- **406K CallerRunsPolicy** — thread pool queue filled, HTTP threads forced to process synchronously
+
+**4. The fundamental mismatch**
+
+MongoDB's document model is a **natural fit** for this access pattern: "give me everything about customer X" is a single primary key lookup on a self-contained document. The subscription array is co-located with the customer — no JOINs, no foreign keys, no row assembly.
+
+Oracle's normalized model is optimized for **ad-hoc queries, referential integrity, and write isolation** — capabilities this workload doesn't need. The overhead of normalization (JOINs, connection pooling, transaction management) provides no benefit for a read-heavy, key-based lookup pattern.
+
+### When Oracle Would Be the Better Choice
+
+Despite losing this benchmark, Oracle (or any RDBMS) would be preferred when:
+- Subscriptions need to be queried independently (e.g., "find all AAPL subscriptions across all customers")
+- Complex reporting or analytics are needed across the subscription data
+- Referential integrity and schema enforcement are requirements
+- The access pattern involves ad-hoc queries rather than key-based document fetches
+- The organization already has Oracle infrastructure and DBA expertise
+
+### Interpreting the MongoDB Results
 
 **2M webhooks processed in 2 minutes 16 seconds with zero failures.**
 
@@ -565,7 +856,7 @@ Memory:
 | Alerts failed | 0 | Zero data loss, zero errors |
 | CallerRunsPolicy | 0 | Thread pool queue never overflowed |
 | Cache hit ratio | 96.8% | 40K HTTP calls instead of 1.2M+ |
-| Avg orchestration | 4.01 ms | MongoDB + market data + Kafka combined |
+| Avg orchestration | 4.01 ms | MongoDB lookup + market data + Kafka combined |
 | System CPU avg | 55.2% | Host machine average across all containers |
 | System CPU peak | 100% | Host saturated at peak (shared with load generator, MongoDB, Kafka) |
 | Per-JVM CPU avg | 6.1% | Each MOO SOR instance is lightweight |
@@ -1647,40 +1938,54 @@ moo-sor-alert-service/
 │   ├── config/
 │   │   ├── AsyncConfig.java                  Thread pool (50/200/50K) + CallerRunsPolicy + metrics
 │   │   ├── KafkaConfig.java                  Topic creation (12 partitions)
-│   │   └── MongoConfig.java                  MongoDB auditing
+│   │   ├── MongoConfig.java                  MongoDB auditing (@Profile("!oracle"))
+│   │   └── OracleConfig.java                 JPA + transaction management (@Profile("oracle"))
 │   ├── controller/
 │   │   └── FactSetWebhookController.java     POST /api/v1/alerts/factset/webhook
 │   ├── service/
+│   │   ├── CustomerDataService.java          DB abstraction interface (findByUserId, updateDateDelivered)
+│   │   ├── MongoCustomerDataService.java     MongoDB implementation (@Profile("!oracle"))
+│   │   ├── OracleCustomerDataService.java    Oracle JPA implementation (@Profile("oracle"))
 │   │   ├── MOOAlertOrchestrationService.java Core orchestration (lookup → validate → enrich → publish)
 │   │   └── MarketDataClient.java             REST client + Caffeine cache
 │   ├── model/
 │   │   ├── FactSetAlert.java                 Inbound webhook payload
-│   │   ├── CustomerDocument.java             MongoDB document
-│   │   ├── Subscription.java                 Embedded subscription array element
+│   │   ├── CustomerDocument.java             Domain model (shared by both DB implementations)
+│   │   ├── Subscription.java                 Subscription domain object
 │   │   ├── ChannelPreference.java            Contact channel (push/email/sms)
 │   │   ├── ContactPreferences.java           Channel list wrapper
 │   │   ├── MarketData.java                   Market data response
-│   │   └── CowAlertMessage.java              Outbound Kafka message
+│   │   ├── CowAlertMessage.java              Outbound Kafka message
+│   │   └── oracle/                           JPA entities for Oracle
+│   │       ├── CustomerEntity.java           CUSTOMERS table entity
+│   │       ├── SubscriptionEntity.java       CUSTOMER_SUBSCRIPTIONS table entity
+│   │       └── ChannelPreferenceEntity.java  CHANNEL_PREFERENCES table entity
 │   └── repository/
-│       └── CustomerRepository.java           Spring Data MongoDB repository
+│       ├── CustomerRepository.java           Spring Data MongoDB repository (@Profile("!oracle"))
+│       ├── OracleCustomerRepository.java     Spring Data JPA repository (@Profile("oracle"))
+│       └── OracleSubscriptionRepository.java JPA repo with updateDateDelivered query (@Profile("oracle"))
 ├── src/main/resources/
-│   └── application.yml                       All configuration
+│   ├── application.yml                       All configuration (default + oracle profile)
+│   └── schema-oracle.sql                     Oracle DDL (tables + indexes)
 ├── src/test/java/com/bank/moo/
 │   ├── load/
 │   │   ├── TestDataGenerator.java            Seeds 500K customers into MongoDB
-│   │   ├── MarketCrashLoadTest.java          2M webhook load generator (Scenario 3)
-│   │   ├── LoadTestRunner.java               Generic HTTP load runner with metrics collection
-│   │   ├── LoadTestScenarios.java            All 6 scenario definitions
+│   │   ├── OracleTestDataGenerator.java      Seeds 500K customers into Oracle (3 tables)
+│   │   ├── MarketCrashLoadTest.java          2M webhook load test (MongoDB)
+│   │   ├── OracleMarketCrashLoadTest.java    2M webhook load test (Oracle)
+│   │   ├── CircuitBreakerDegradationTest.java 200K degradation test
+│   │   ├── LoadTestScenarios.java            All scenario definitions
 │   │   └── PerformanceReportGenerator.java   Formatted report output
 │   ├── service/
-│   │   ├── MOOAlertOrchestrationServiceTest.java  6 unit tests
+│   │   ├── MOOAlertOrchestrationServiceTest.java  Unit tests (mocks CustomerDataService)
 │   │   └── MarketDataClientTest.java              Cache behavior tests
 │   └── mock/
 │       └── MockMarketDataServer.java         Embedded HTTP server for unit tests
 ├── mock-market-data/                         Standalone Spring Boot mock (Docker)
-├── docker-compose.yml                        Full environment (MongoDB, Kafka, 4 instances)
+├── docker-compose.yml                        Full environment (MongoDB, Kafka, Oracle, 4 instances)
+├── docker-compose-oracle.yml                 Override: switches instances to oracle profile
 ├── Dockerfile                                Multi-stage build
-└── build.gradle                              Dependencies and test configuration
+└── build.gradle                              Dependencies, test config, seedOracle/oracleLoadTest tasks
 ```
 
 ## Metrics (Micrometer)

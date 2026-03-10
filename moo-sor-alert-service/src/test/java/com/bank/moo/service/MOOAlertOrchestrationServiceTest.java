@@ -1,7 +1,6 @@
 package com.bank.moo.service;
 
 import com.bank.moo.model.*;
-import com.bank.moo.repository.CustomerRepository;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,9 +9,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -32,8 +28,7 @@ import static org.mockito.Mockito.*;
 @ExtendWith(MockitoExtension.class)
 class MOOAlertOrchestrationServiceTest {
 
-    @Mock private CustomerRepository customerRepository;
-    @Mock private MongoTemplate mongoTemplate;
+    @Mock private CustomerDataService customerDataService;
     @Mock private MarketDataClient marketDataClient;
     @Mock private KafkaTemplate<String, CowAlertMessage> kafkaTemplate;
 
@@ -45,7 +40,7 @@ class MOOAlertOrchestrationServiceTest {
         meterRegistry = new SimpleMeterRegistry();
         CircuitBreakerRegistry circuitBreakerRegistry = CircuitBreakerRegistry.ofDefaults();
         service = new MOOAlertOrchestrationService(
-                customerRepository, mongoTemplate, marketDataClient, kafkaTemplate,
+                customerDataService, marketDataClient, kafkaTemplate,
                 meterRegistry, circuitBreakerRegistry);
         ReflectionTestUtils.setField(service, "kafkaTopic", "moo-customer-alerts");
     }
@@ -57,7 +52,7 @@ class MOOAlertOrchestrationServiceTest {
         FactSetAlert alert = new FactSetAlert("FS-TRIG-88421", "6", "AAPL", "-5.2", "2026-02-23T14:31:58.112Z");
 
         CustomerDocument customer = buildCustomer(userId, "Y", null);
-        when(customerRepository.findById(userId)).thenReturn(Optional.of(customer));
+        when(customerDataService.findByUserId(userId)).thenReturn(Optional.of(customer));
 
         MarketData marketData = buildMarketData();
         when(marketDataClient.getMarketData("AAPL")).thenReturn(marketData);
@@ -69,7 +64,7 @@ class MOOAlertOrchestrationServiceTest {
         service.processAlertAsync(userId, alert);
 
         // Then (allow async to complete — since @Async won't work in unit test, it runs synchronously)
-        verify(mongoTemplate).updateFirst(any(Query.class), any(Update.class), eq(CustomerDocument.class));
+        verify(customerDataService).updateDateDelivered(eq(userId), eq("FS-TRIG-88421"));
         verify(kafkaTemplate).send(eq("moo-customer-alerts"), eq("CUST-9938271"), any(CowAlertMessage.class));
     }
 
@@ -79,7 +74,7 @@ class MOOAlertOrchestrationServiceTest {
         FactSetAlert alert = new FactSetAlert("FS-TRIG-88421", "6", "AAPL", "-5.2", "2026-02-23T14:31:58.112Z");
 
         CustomerDocument customer = buildCustomer(userId, "N", null);
-        when(customerRepository.findById(userId)).thenReturn(Optional.of(customer));
+        when(customerDataService.findByUserId(userId)).thenReturn(Optional.of(customer));
 
         service.processAlertAsync(userId, alert);
 
@@ -96,7 +91,7 @@ class MOOAlertOrchestrationServiceTest {
         Instant todayDelivery = LocalDate.now(ZoneId.of("America/New_York"))
                 .atStartOfDay(ZoneId.of("America/New_York")).toInstant().plusSeconds(3600);
         CustomerDocument customer = buildCustomer(userId, "Y", todayDelivery);
-        when(customerRepository.findById(userId)).thenReturn(Optional.of(customer));
+        when(customerDataService.findByUserId(userId)).thenReturn(Optional.of(customer));
 
         service.processAlertAsync(userId, alert);
 
@@ -113,7 +108,7 @@ class MOOAlertOrchestrationServiceTest {
         Instant yesterdayDelivery = LocalDate.now(ZoneId.of("America/New_York"))
                 .minusDays(1).atStartOfDay(ZoneId.of("America/New_York")).toInstant().plusSeconds(3600);
         CustomerDocument customer = buildCustomer(userId, "Y", yesterdayDelivery);
-        when(customerRepository.findById(userId)).thenReturn(Optional.of(customer));
+        when(customerDataService.findByUserId(userId)).thenReturn(Optional.of(customer));
 
         MarketData marketData = buildMarketData();
         when(marketDataClient.getMarketData("AAPL")).thenReturn(marketData);
@@ -131,7 +126,7 @@ class MOOAlertOrchestrationServiceTest {
         String userId = "nonexistent";
         FactSetAlert alert = new FactSetAlert("FS-TRIG-88421", "6", "AAPL", "-5.2", "2026-02-23T14:31:58.112Z");
 
-        when(customerRepository.findById(userId)).thenReturn(Optional.empty());
+        when(customerDataService.findByUserId(userId)).thenReturn(Optional.empty());
 
         service.processAlertAsync(userId, alert);
 
@@ -145,7 +140,7 @@ class MOOAlertOrchestrationServiceTest {
         FactSetAlert alert = new FactSetAlert("FS-TRIG-88421", "6", "AAPL", "-5.2", "2026-02-23T14:31:58.112Z");
 
         CustomerDocument customer = buildCustomer(userId, "Y", null);
-        when(customerRepository.findById(userId)).thenReturn(Optional.of(customer));
+        when(customerDataService.findByUserId(userId)).thenReturn(Optional.of(customer));
 
         MarketData marketData = buildMarketData();
         when(marketDataClient.getMarketData("AAPL")).thenReturn(marketData);
