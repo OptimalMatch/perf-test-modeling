@@ -113,6 +113,7 @@ spring:
       idle-timeout: 300000
       max-lifetime: 600000
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: none
     database-platform: org.hibernate.dialect.OracleDialect
@@ -120,6 +121,7 @@ spring:
     properties:
       hibernate:
         format_sql: false
+        generate_statistics: false
         jdbc:
           batch_size: 50
         order_inserts: true
