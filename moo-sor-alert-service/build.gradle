@@ -70,3 +70,31 @@ tasks.register('oracleLoadTest', JavaExec) {
     mainClass = 'com.bank.moo.load.OracleMarketCrashLoadTest'
     jvmArgs = ['-Xmx4g', '-Xms2g']
 }
+
+// Seed MongoDB with embedded model test data
+tasks.register('seedMongo', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.bank.moo.load.TestDataGenerator'
+    jvmArgs = ['-Xmx4g', '-Xms2g']
+}
+
+// Run embedded MongoDB load test
+tasks.register('mongoLoadTest', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.bank.moo.load.MarketCrashLoadTest'
+    jvmArgs = ['-Xmx4g', '-Xms2g']
+}
+
+// Seed MongoDB with flat model test data
+tasks.register('seedMongoFlat', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.bank.moo.load.FlatMongoTestDataGenerator'
+    jvmArgs = ['-Xmx4g', '-Xms2g']
+}
+
+// Run flat MongoDB load test
+tasks.register('mongoFlatLoadTest', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.bank.moo.load.FlatMongoMarketCrashLoadTest'
+    jvmArgs = ['-Xmx4g', '-Xms2g']
+}

@@ -91,6 +91,22 @@ logging:
     org.mongodb: WARN
 
 ---
+# Flat MongoDB profile - activated with: --spring.profiles.active=mongo-flat
+# Uses one document per subscription instead of one document per customer
+spring:
+  config:
+    activate:
+      on-profile: mongo-flat
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/moo
+
+---
 # Oracle profile - activated with: --spring.profiles.active=oracle
 spring:
   config:

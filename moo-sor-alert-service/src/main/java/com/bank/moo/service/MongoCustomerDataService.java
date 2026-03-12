@@ -13,7 +13,7 @@ import java.time.Instant;
 import java.util.Optional;
 
 @Service
-@Profile("!oracle")
+@Profile("!oracle & !mongo-flat")
 public class MongoCustomerDataService implements CustomerDataService {
 
     private final CustomerRepository customerRepository;

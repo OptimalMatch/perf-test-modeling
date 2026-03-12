@@ -6,6 +6,6 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Repository;
 
 @Repository
-@Profile("!oracle")
+@Profile("!oracle & !mongo-flat")
 public interface CustomerRepository extends MongoRepository<CustomerDocument, String> {
 }

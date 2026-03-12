@@ -1,0 +1,41 @@
+version: '3.8'
+
+# Overlay for flat MongoDB model testing.
+# Usage: docker-compose -f docker-compose.yml -f docker-compose-mongo-flat.yml up --build
+#
+# This activates the 'mongo-flat' Spring profile on all MOO SOR instances,
+# which uses the FlatAlertDocument model (one doc per subscription) instead of
+# the embedded CustomerDocument model (one doc per customer with nested subscriptions).
+
+services:
+  moo-sor-1:
+    environment:
+      SPRING_PROFILES_ACTIVE: mongo-flat
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/moo
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+
+  moo-sor-2:
+    environment:
+      SPRING_PROFILES_ACTIVE: mongo-flat
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/moo
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+
+  moo-sor-3:
+    environment:
+      SPRING_PROFILES_ACTIVE: mongo-flat
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/moo
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
+
+  moo-sor-4:
+    environment:
+      SPRING_PROFILES_ACTIVE: mongo-flat
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/moo
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MOO_MARKET_DATA_BASE_URL: http://mock-market-data:8081
+      SERVER_PORT: 8080
