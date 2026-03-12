@@ -16,7 +16,8 @@ flowchart LR
 ```
 
 The database layer is abstracted behind a `CustomerDataService` interface. Spring profiles control which implementation is active:
-- **Default (no profile)**: MongoDB — single document per customer with embedded subscription arrays
+- **Default (no profile)**: MongoDB embedded — single document per customer with embedded subscription arrays
+- **`mongo-flat` profile**: MongoDB flat — one document per subscription per customer (denormalized)
 - **`oracle` profile**: Oracle 23ai — normalized relational model (3 tables, one row per subscription)
 
 - **MOO SOR** is the service we build and test — it owns no Kafka topics, only publishes to Cow's `moo-customer-alerts` topic
@@ -253,6 +254,84 @@ Single collection: `customers`
 }
 ```
 
+## MongoDB Flat Document Structure (Alternative)
+
+When running with the `mongo-flat` profile, each subscription becomes its own document in a `customer_alerts` collection. Customer info and channel preferences are denormalized into every document.
+
+Collection: `customer_alerts`
+
+```json
+{
+  "_id": ObjectId("auto-generated"),
+  "customerId": "64a7f3b2c1d4e5f6a7b8c9d0",
+  "customerCode": "CUST-9938271",
+  "firstName": "Margaret",
+  "lastName": "Thornton",
+  "channels": [
+    { "type": "PUSH_NOTIFICATION", "enabled": true, "priority": 1 },
+    { "type": "EMAIL", "enabled": true, "priority": 2, "address": "m.thornton@email.com" },
+    { "type": "SMS", "enabled": true, "priority": 3, "phoneNumber": "+12125551234" }
+  ],
+  "symbol": "AAPL",
+  "factSetTriggerId": "FS-TRIG-88421",
+  "triggerTypeId": "6",
+  "value": "-5",
+  "activeState": "Y",
+  "subscribedAt": "2025-09-15T10:00:00.000Z",
+  "dateDelivered": null
+}
+```
+
+### Embedded vs Flat: Data Model Comparison
+
+```
+MongoDB Embedded (1 doc per customer, default):
+┌──────────────────────────────────────────┐
+│ { _id: "abc",                            │
+│   customerId: "CUST-001",                │
+│   subscriptions: [                       │  ← embedded array
+│     { symbol: "AAPL", triggerId: ... },  │
+│     { symbol: "MSFT", triggerId: ... }   │
+│   ],                                     │
+│   contactPreferences: { channels: [...] }│
+│ }                                        │
+└──────────────────────────────────────────┘
+  → 500K documents for 500K customers
+  → 1 read by _id returns everything
+  → 1 $elemMatch + positional $ update modifies subscription in-place
+
+MongoDB Flat (1 doc per subscription, mongo-flat profile):
+┌─────────────────────────────────────────┐
+│ { customerId: "abc",                    │
+│   customerCode: "CUST-001",             │
+│   firstName: "...", lastName: "...",     │  ← denormalized
+│   channels: [...],                      │  ← denormalized
+│   symbol: "AAPL",                       │
+│   factSetTriggerId: "FS-TRIG-001",      │
+│   activeState: "Y",                     │
+│   dateDelivered: null                   │
+│ }                                       │
+└─────────────────────────────────────────┘
+  → ~2.5M documents for 500K customers (avg 5 subscriptions each)
+  → Read requires multi-doc query by customerId index + reassembly
+  → Update is a simple single-doc update by compound index (no positional ops)
+```
+
+### Data Volume (500K Customers)
+
+| Collection | Documents | Notes |
+|------------|-----------|-------|
+| `customers` (embedded) | 500,000 | 1 doc per customer, ~5 embedded subscriptions each |
+| `customer_alerts` (flat) | ~2,500,000 | 1 doc per subscription, customer data denormalized |
+
+### Indexes
+
+| Collection | Index | Purpose |
+|------------|-------|---------|
+| `customers` | `_id` (default) | Primary key lookup by userId |
+| `customer_alerts` | `{customerId: 1}` | Fetch all subscriptions for a customer |
+| `customer_alerts` | `{customerId: 1, factSetTriggerId: 1}` (unique) | Update specific subscription |
+
 ## Oracle Table Structure (Alternative)
 
 When running with the `oracle` profile, the same customer data is stored in a normalized relational model across three tables. Each subscription that was an embedded array element in MongoDB becomes **its own row** in Oracle.
@@ -415,14 +494,15 @@ executor.setRejectedExecutionHandler(new CallerRunsPolicy());  // overflow → c
 
 ## Quick Start
 
-The service supports two database backends, selected via Spring profile:
+The service supports three database configurations, selected via Spring profile:
 
 | Mode | Profile | Database | Docker Compose |
 |------|---------|----------|---------------|
-| **MongoDB** (default) | none | MongoDB 7.0 | `docker compose up` |
+| **MongoDB Embedded** (default) | none | MongoDB 7.0 | `docker compose up` |
+| **MongoDB Flat** | `mongo-flat` | MongoDB 7.0 | `docker compose -f docker-compose.yml -f docker-compose-mongo-flat.yml up` |
 | **Oracle** | `oracle` | Oracle 23ai Free | `docker compose -f docker-compose.yml -f docker-compose-oracle.yml up` |
 
-### Option A: MongoDB (Default)
+### Option A: MongoDB Embedded (Default)
 
 #### 1. Start Infrastructure
 
@@ -448,7 +528,31 @@ This inserts 500K customer documents into MongoDB with:
 - 70% eligible (dateDelivered null) / 30% already delivered today
 - ~1.4M total eligible webhook targets
 
-### Option B: Oracle
+### Option B: MongoDB Flat
+
+#### 1. Start Infrastructure
+
+```bash
+cd moo-sor-alert-service
+docker compose -f docker-compose.yml -f docker-compose-mongo-flat.yml up --build -d
+```
+
+This starts the same infrastructure as Option A but overrides MOO SOR instances to use the `mongo-flat` profile (one document per subscription instead of one document per customer).
+
+#### 2. Seed Test Data
+
+```bash
+# Via Gradle:
+./gradlew seedMongoFlat
+
+# Or directly:
+$JAVA_HOME/bin/java -Xmx4g -Xms2g -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
+  com.bank.moo.load.FlatMongoTestDataGenerator mongodb://localhost:27017 500000
+```
+
+This inserts ~2.5M alert documents into the `customer_alerts` collection (avg ~5 per customer), with the same data distribution and random seed as the embedded model.
+
+### Option C: Oracle
 
 #### 1. Start Infrastructure with Oracle Overlay
 
@@ -558,11 +662,14 @@ Kafka uses dual listeners:
 # MongoDB mode (default)
 docker compose up --build -d
 
+# MongoDB flat mode
+docker compose -f docker-compose.yml -f docker-compose-mongo-flat.yml up --build -d
+
 # Oracle mode
 docker compose -f docker-compose.yml -f docker-compose-oracle.yml up --build -d
 ```
 
-The `docker-compose-oracle.yml` overlay sets `SPRING_PROFILES_ACTIVE=oracle` on each MOO SOR instance, pointing them at the Oracle container instead of MongoDB. Both containers are started in either mode, but only one is used by the service.
+The overlay files set `SPRING_PROFILES_ACTIVE` on each MOO SOR instance (`mongo-flat` or `oracle`), selecting the appropriate `CustomerDataService` implementation. All infrastructure containers (MongoDB, Oracle, Kafka) are started in every mode, but only the relevant database is used by the service.
 
 ## Load Testing
 
@@ -579,22 +686,38 @@ The `docker-compose-oracle.yml` overlay sets `SPRING_PROFILES_ACTIVE=oracle` on 
 
 ### Running the Market Crash Scenario (Scenario 3)
 
-#### MongoDB
+#### MongoDB Embedded
 
 ```bash
-# 1. Start with MongoDB (default)
+# 1. Start with MongoDB embedded (default)
 docker compose up --build -d
 
 # 2. Seed test data
-./gradlew compileTestJava
-$JAVA_HOME/bin/java -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
-  com.bank.moo.load.TestDataGenerator mongodb://localhost:27017 500000
+./gradlew seedMongo
+# Or: ./gradlew compileTestJava && $JAVA_HOME/bin/java -cp "..." com.bank.moo.load.TestDataGenerator
 
 # 3. Run the load test
-$JAVA_HOME/bin/java -Xmx4g -Xms2g -cp "build/classes/java/test:build/classes/java/main:$(find ~/.gradle/caches/modules-2/files-2.1 -name '*.jar' | tr '\n' ':')" \
-  com.bank.moo.load.MarketCrashLoadTest
+./gradlew mongoLoadTest
 
 # Report saved to /tmp/moo-market-crash-report.txt
+```
+
+#### MongoDB Flat
+
+```bash
+# 1. Start with MongoDB flat model
+docker compose -f docker-compose.yml -f docker-compose-mongo-flat.yml up --build -d
+
+# 2. Seed flat test data
+./gradlew seedMongoFlat
+
+# 3. Restart instances to clear metrics
+docker restart moo-sor-1 moo-sor-2 moo-sor-3 moo-sor-4
+
+# 4. Run the flat model load test
+./gradlew mongoFlatLoadTest
+
+# Report saved to /tmp/moo-mongo-flat-market-crash-report.txt
 ```
 
 #### Oracle
@@ -647,30 +770,32 @@ docker stop moo-sor-2
 
 Actual results from running Scenario 3 on a single dev machine (4 containerized instances, no CPU/memory limits):
 
+### MongoDB Embedded (Default)
+
 ```
 ═══════════════════════════════════════════════════════
 MOO SOR Performance Test Report
 ═══════════════════════════════════════════════════════
 Scenario:                    Market Crash (2M alerts, 4 instances)
-Duration:                    2 minutes 16 seconds
-Send phase:                  2 minutes 16 seconds
+Duration:                    2 minutes 39 seconds
+Send phase:                  2 minutes 39 seconds
 Total webhooks sent:         2,000,000
-Total alerts processed:      1,263,809
-Total alerts skipped:        736,191 (inactive: 0, throttled: 736,191, not found: 0)
+Total alerts processed:      1,065,263
+Total alerts skipped:        934,737 (inactive: 0, throttled: 934,737, not found: 0)
 Total alerts failed:         0
 Network/HTTP errors:         0 (send) + 0 (http)
 
 Webhook Response Time:
-  P50:                       659.62 ms
-  P95:                       891.59 ms
-  P99:                       1323.44 ms
-  Max:                       3154.43 ms
+  P50:                       817.31 ms
+  P95:                       1070.47 ms
+  P99:                       1403.51 ms
+  Max:                       3262.36 ms
 
 Orchestration Throughput:
-  Avg:                       9,293 /sec (across 4 instances)
-  Per instance avg:          2,323 /sec
-  Peak send rate:            26,787 /sec
-  Avg orchestration time:    4.01 ms
+  Avg:                       6,700 /sec (across 4 instances)
+  Per instance avg:          1,675 /sec
+  Peak send rate:            24,247 /sec
+  Avg orchestration time:    3.33 ms
 
 Thread Pool:
   Peak queue depth:          0 (at query time)
@@ -678,37 +803,155 @@ Thread Pool:
   Peak active threads:       0 (at query time)
 
 MongoDB:
-  Avg lookup time:           1.42 ms
-  Avg update time:           1.85 ms
-  Total ops:                 3,263,809
+  Avg lookup time:           1.20 ms
+  Avg update time:           1.58 ms
+  Total ops:                 3,065,263
 
 Market Data:
-  Cache hit ratio:           96.8%
-  Cache hits:                1,223,698
-  Cache misses:              40,111
-  Avg fetch time (miss):     3.32 ms
+  Cache hit ratio:           95.9%
+  Cache hits:                1,021,806
+  Cache misses:              43,457
+  Avg fetch time (miss):     3.64 ms
 
 Kafka:
-  Messages published:        1,263,809
-  Avg publish time:          2.14 ms
+  Messages published:        1,065,263
+  Avg publish time:          2.20 ms
 
 CPU (sampled every 2s):
   System CPU (host):
-    Avg:                     55.2%
-    Peak:                    100.0%
+    Avg:                     47.5%
+    Peak:                    99.9%
   Process CPU (per JVM):
-    Instance 1:              avg 6.1%, peak 19.3%
-    Instance 2:              avg 6.1%, peak 18.2%
-    Instance 3:              avg 6.0%, peak 18.1%
-    Instance 4:              avg 6.2%, peak 19.5%
-    Overall avg:             6.1%
-    Overall peak:            19.5%
-  Samples collected:         276
+    Instance 1:              avg 5.2%, peak 18.6%
+    Instance 2:              avg 5.1%, peak 19.2%
+    Instance 3:              avg 5.2%, peak 23.4%
+    Instance 4:              avg 5.3%, peak 21.5%
+    Overall avg:             5.2%
+    Overall peak:            23.4%
+  Samples collected:         320
 
 Memory:
-  Load generator heap:       1,548 MB
+  Load generator heap:       1,212 MB
 ═══════════════════════════════════════════════════════
 ```
+
+### MongoDB Flat Model Performance Results
+
+Same scenario (2M webhooks, 4 instances, same dev machine) with the `mongo-flat` profile — one document per subscription instead of one document per customer.
+
+```
+═══════════════════════════════════════════════════════
+MOO SOR Performance Test Report — FLAT MONGO MODEL
+═══════════════════════════════════════════════════════
+Data Model:                  Flat (1 doc per subscription, denormalized)
+Scenario:                    Market Crash (2M alerts, 4 instances)
+Duration:                    2 minutes 30 seconds
+Send phase:                  2 minutes 30 seconds
+Total webhooks sent:         2,000,000
+Total alerts processed:      1,065,815
+Total alerts skipped:        934,185 (inactive: 0, throttled: 934,185, not found: 0)
+Total alerts failed:         0
+Network/HTTP errors:         0 (send) + 0 (http)
+
+Webhook Response Time:
+  P50:                       736.40 ms
+  P95:                       1038.10 ms
+  P99:                       1425.24 ms
+  Max:                       3809.98 ms
+
+Orchestration Throughput:
+  Avg:                       7,105 /sec (across 4 instances)
+  Per instance avg:          1,776 /sec
+  Peak send rate:            22,469 /sec
+  Avg orchestration time:    4.40 ms
+
+Thread Pool:
+  Peak queue depth:          0 (at query time)
+  CallerRunsPolicy count:    0
+  Peak active threads:       0 (at query time)
+
+MongoDB (Flat Model):
+  Avg lookup time:           1.77 ms
+  Avg update time:           2.46 ms
+  Total ops:                 3,065,815
+
+Market Data:
+  Cache hit ratio:           96.2%
+  Cache hits:                1,025,691
+  Cache misses:              40,124
+  Avg fetch time (miss):     3.81 ms
+
+Kafka:
+  Messages published:        1,065,815
+  Avg publish time:          2.30 ms
+
+CPU (sampled every 2s):
+  System CPU (host):
+    Avg:                     53.0%
+    Peak:                    100.0%
+  Process CPU (per JVM):
+    Instance 1:              avg 6.0%, peak 19.2%
+    Instance 2:              avg 6.0%, peak 19.2%
+    Instance 3:              avg 6.0%, peak 20.3%
+    Instance 4:              avg 6.1%, peak 23.6%
+    Overall avg:             6.0%
+    Overall peak:            23.6%
+  Samples collected:         304
+
+Memory:
+  Load generator heap:       1,472 MB
+═══════════════════════════════════════════════════════
+```
+
+### MongoDB Embedded vs Flat: Head-to-Head Comparison
+
+Both tests used identical data (same random seed, 500K customers, ~1.4M eligible targets) and ran on the same machine.
+
+| Metric | Embedded | Flat | Delta |
+|--------|----------|------|-------|
+| **Total duration** | 2m 39s | 2m 30s | **Flat 6% faster** |
+| **Throughput (aggregate)** | 6,700/sec | 7,105/sec | **Flat +6%** |
+| **Per instance throughput** | 1,675/sec | 1,776/sec | **Flat +6%** |
+| **Alerts processed** | 1,065,263 | 1,065,815 | ~same |
+| **Alerts failed** | 0 | 0 | tie |
+| **P50 response** | 817ms | 736ms | **Flat 10% better** |
+| **P95 response** | 1,070ms | 1,038ms | **Flat 3% better** |
+| **P99 response** | 1,404ms | 1,425ms | ~same |
+| **Max response** | 3,262ms | 3,810ms | Embedded 14% better |
+| **DB lookup time** | 1.20ms | 1.77ms | Embedded 32% faster |
+| **DB update time** | 1.58ms | 2.46ms | Embedded 36% faster |
+| **Avg orchestration time** | 3.33ms | 4.40ms | Embedded 24% faster |
+| **Per-JVM CPU avg** | 5.2% | 6.0% | Embedded 13% less CPU |
+| **System CPU avg** | 47.5% | 53.0% | Embedded less host load |
+| **Cache hit ratio** | 95.9% | 96.2% | ~same |
+| **CallerRunsPolicy** | 0 | 0 | tie |
+
+### Why Flat Is Slightly Faster Overall Despite Slower Per-Operation DB Times
+
+**1. Write contention is lower in the flat model.**
+
+In the embedded model, concurrent webhooks for the same customer compete for a document-level lock on one large customer document. In the flat model, each subscription is its own document — concurrent updates to different subscriptions for the same customer don't contend.
+
+**2. Per-op DB times favor embedded, but the gap is small.**
+
+Embedded lookups (1.20ms) are faster than flat multi-doc queries (1.77ms) because a single `_id` fetch beats an indexed `customerId` query returning ~5 documents that must be reassembled. Embedded updates (1.58ms) are faster than flat updates (2.46ms) because MongoDB optimizes in-place array modifications. But both are well under 3ms — the difference is small in absolute terms.
+
+**3. The throughput difference (~6%) is within noise for most practical purposes.**
+
+On a shared dev machine, background processes, garbage collection, and kernel scheduling introduce significant variance. The two models are effectively equivalent for this workload.
+
+### When to Prefer Each Model
+
+| Consideration | Embedded | Flat |
+|--------------|----------|------|
+| Read-heavy, fetch-all-subscriptions | Preferred (single doc fetch) | Slower (multi-doc query + reassembly) |
+| Write-heavy, high contention on same customer | Risk of document-level lock contention | Preferred (independent doc updates) |
+| Large subscription counts per customer | Risk hitting 16MB doc limit | No document size concern |
+| Storage efficiency | Better (no denormalized customer data) | ~5x more storage (customer info repeated per subscription) |
+| Query subscriptions independently (e.g., "all AAPL subscriptions") | Requires aggregation pipeline | Simple indexed query |
+| Simplicity | Simpler (one doc = one customer) | More moving parts (reassembly logic, compound indexes) |
+
+For this specific workload (webhook-driven, lookup by customer, update one subscription), **both models perform nearly identically** and the choice comes down to secondary concerns like document size limits, independent subscription queries, or team familiarity.
 
 ### Oracle Market Crash Performance Results
 
@@ -793,30 +1036,32 @@ Memory:
 
 The JdbcTemplate single-query approach nearly halved lookup time by eliminating Hibernate's 3 separate EAGER-fetch queries, entity tracking, dirty checking, and proxy creation. Overall throughput remained similar because the bottleneck is Oracle Free's single-container CPU — the Java-side optimization reduced per-operation latency but Oracle itself is saturated.
 
-### MongoDB vs Oracle: Head-to-Head Comparison
+### All Three Models: Head-to-Head Comparison
 
-| Metric | MongoDB | Oracle (tuned) | Factor |
-|--------|---------|--------|--------|
-| **Total duration** | 2m 16s | 6m 56s | **3.1x slower** |
-| **Throughput (aggregate)** | 9,293/sec | 2,102/sec | **4.4x lower** |
-| **Per instance throughput** | 2,323/sec | 526/sec | **4.4x lower** |
-| **Alerts processed** | 1,263,809 | 874,597 | 31% fewer |
-| **Alerts failed** | 0 | 626,902 | Circuit breaker trips under Oracle saturation |
-| **CallerRunsPolicy** | 0 | 806,884 | Backpressure (50 threads, matched to 50 connections) |
-| **P50 response** | 660ms | 1,117ms | 1.7x |
-| **P99 response** | 1,323ms | 6,340ms | **4.8x** |
-| **DB lookup time** | 1.42ms | **121.52ms** | **86x slower** |
-| **DB update time** | 1.85ms | **163.49ms** | **88x slower** |
-| **Avg orchestration time** | 4.01ms | 155.48ms | **39x slower** |
-| **Kafka publish** | 2.14ms | 0.69ms | Similar |
-| **Cache hit ratio** | 96.8% | 88.7% | Lower due to slower processing |
-| **Per-JVM CPU** | 6.1% avg | 4.0% avg | I/O bound waiting on Oracle |
+| Metric | MongoDB Embedded | MongoDB Flat | Oracle (tuned) |
+|--------|-----------------|-------------|----------------|
+| **Total duration** | 2m 39s | 2m 30s | 6m 56s |
+| **Throughput (aggregate)** | 6,700/sec | 7,105/sec | 2,102/sec |
+| **Per instance throughput** | 1,675/sec | 1,776/sec | 526/sec |
+| **Alerts processed** | 1,065,263 | 1,065,815 | 874,597 |
+| **Alerts failed** | 0 | 0 | 626,902 |
+| **CallerRunsPolicy** | 0 | 0 | 806,884 |
+| **P50 response** | 817ms | 736ms | 1,117ms |
+| **P95 response** | 1,070ms | 1,038ms | 5,087ms |
+| **P99 response** | 1,404ms | 1,425ms | 6,340ms |
+| **DB lookup time** | 1.20ms | 1.77ms | 121.52ms |
+| **DB update time** | 1.58ms | 2.46ms | 163.49ms |
+| **Avg orchestration time** | 3.33ms | 4.40ms | 155.48ms |
+| **Kafka publish** | 2.20ms | 2.30ms | 0.69ms |
+| **Cache hit ratio** | 95.9% | 96.2% | 88.7% |
+| **Per-JVM CPU avg** | 5.2% | 6.0% | 4.0% |
+| **System CPU avg** | 47.5% | 53.0% | 32.5% |
 
 ### Why Oracle Is Slower for This Workload
 
 **1. Read path: JOIN vs embedded document**
 
-MongoDB returns the entire customer document (subscriptions + channels) in a **single `_id` lookup** (~1.4ms). The document is stored contiguously — one disk seek, one network round trip.
+MongoDB returns the entire customer document (subscriptions + channels) in a **single `_id` lookup** (~1.2ms embedded, ~1.8ms flat). The embedded model reads one contiguous document; the flat model queries ~5 documents by indexed `customerId` and reassembles them.
 
 Oracle requires a 3-table JOIN even with the tuned JdbcTemplate approach:
 ```sql
@@ -830,7 +1075,7 @@ This involves 3 index lookups and row assembly — **121ms avg** under load (dow
 
 **2. Write path: positional update vs row update**
 
-MongoDB's `$elemMatch` + positional `$set` updates a single field within an embedded array element in-place (~1.85ms). No row locking, no transaction overhead.
+MongoDB's embedded model uses `$elemMatch` + positional `$set` to update a single field within an embedded array element in-place (~1.6ms). The flat model does a simple single-document update by compound index (~2.5ms). No row locking, no transaction overhead in either case.
 
 Oracle's `UPDATE CUSTOMER_SUBSCRIPTIONS SET DATE_DELIVERED = ? WHERE CUSTOMER_ID = ? AND FACTSET_TRIGGER_ID = ?` requires a row lock, index seek, redo log write, and commit — **163ms avg** under contention with 50 concurrent threads per instance.
 
@@ -857,31 +1102,28 @@ Despite losing this benchmark, Oracle (or any RDBMS) would be preferred when:
 
 ### Interpreting the MongoDB Results
 
-**2M webhooks processed in 2 minutes 16 seconds with zero failures.**
+**2M webhooks processed in ~2.5 minutes with zero failures across both MongoDB models.**
 
-| Metric | Result | Notes |
-|--------|--------|-------|
-| Total time | 2m 16s | Well under the 15-min target |
-| Throughput | 9,293/sec aggregate | 2,323/sec per instance |
-| Alerts processed | 1,263,809 | Remaining 736,191 correctly throttled |
-| Alerts failed | 0 | Zero data loss, zero errors |
-| CallerRunsPolicy | 0 | Thread pool queue never overflowed |
-| Cache hit ratio | 96.8% | 40K HTTP calls instead of 1.2M+ |
-| Avg orchestration | 4.01 ms | MongoDB lookup + market data + Kafka combined |
-| System CPU avg | 55.2% | Host machine average across all containers |
-| System CPU peak | 100% | Host saturated at peak (shared with load generator, MongoDB, Kafka) |
-| Per-JVM CPU avg | 6.1% | Each MOO SOR instance is lightweight |
-| Per-JVM CPU peak | 19.5% | Brief spikes during high-throughput windows |
+| Metric | Embedded | Flat | Notes |
+|--------|----------|------|-------|
+| Total time | 2m 39s | 2m 30s | Both well under the 15-min target |
+| Throughput | 6,700/sec | 7,105/sec | Aggregate across 4 instances |
+| Alerts processed | 1,065,263 | 1,065,815 | ~935K correctly throttled in each |
+| Alerts failed | 0 | 0 | Zero data loss, zero errors |
+| CallerRunsPolicy | 0 | 0 | Thread pool queue never overflowed |
+| Cache hit ratio | 95.9% | 96.2% | ~43K HTTP calls instead of 1M+ |
+| Avg orchestration | 3.33ms | 4.40ms | MongoDB lookup + market data + Kafka combined |
+| Per-JVM CPU avg | 5.2% | 6.0% | Each MOO SOR instance is lightweight |
 
-**Why 736K were throttled**: The test builds 2M payloads by sampling from ~1.4M eligible targets. Many targets get sampled multiple times. After the first webhook for a given customer+trigger sets `dateDelivered`, all subsequent webhooks for the same target within the same day are correctly throttled. This is the deduplication logic working exactly as designed.
+**Why ~935K were throttled**: The test builds 2M payloads by sampling from ~1.4M eligible targets. Many targets get sampled multiple times. After the first webhook for a given customer+trigger sets `dateDelivered`, all subsequent webhooks for the same target within the same day are correctly throttled. This is the deduplication logic working exactly as designed.
 
-**Why webhook response times show ~660ms P50**: The load generator pushed ~14,600 req/sec with a 10K in-flight semaphore — the high response times reflect **client-side queuing** in the semaphore, not server latency. The actual webhook handler dispatch (accept + enqueue to thread pool) averaged sub-millisecond. The server was never the bottleneck.
+**Why webhook response times show ~740-820ms P50**: The load generator pushed ~12-13K req/sec with a 10K in-flight semaphore — the high response times reflect **client-side queuing** in the semaphore, not server latency. The actual webhook handler dispatch (accept + enqueue to thread pool) averaged sub-millisecond. The server was never the bottleneck.
 
 ### CPU Analysis
 
-The test sampled `process.cpu.usage` and `system.cpu.usage` from each JVM instance every 2 seconds via the Micrometer actuator endpoint (276 total samples across 4 instances).
+The test sampled `process.cpu.usage` and `system.cpu.usage` from each JVM instance every 2 seconds via the Micrometer actuator endpoint (~300 total samples across 4 instances).
 
-**Per-JVM CPU is low (~6% avg)** because each orchestration is I/O-bound (MongoDB lookup → market data fetch → Kafka publish), not compute-bound. The 200-thread pool spends most of its time waiting on network I/O, not burning CPU cycles.
+**Per-JVM CPU is low (~5-6% avg)** because each orchestration is I/O-bound (MongoDB lookup → market data fetch → Kafka publish), not compute-bound. The 200-thread pool spends most of its time waiting on network I/O, not burning CPU cycles.
 
 **Host CPU hit 100% at peak** because the Docker host was shared between all containers — the 4 MOO SOR instances, MongoDB, Kafka, Zookeeper, and the load generator itself (200 sender threads + 10K async HTTP connections). In a production OCP cluster with dedicated nodes, each component would have isolated CPU resources.
 
@@ -889,8 +1131,8 @@ The test sampled `process.cpu.usage` and `system.cpu.usage` from each JVM instan
 | Component | Estimated CPU Share | Why |
 |-----------|-------------------|-----|
 | Load generator | ~25-30% | 200 sender threads, HTTP connection management, response time tracking |
-| MongoDB | ~15-20% | 3.2M total ops (1.2M lookups + 1.2M updates + throttle checks) |
-| 4× MOO SOR JVMs | ~24% total (~6% each) | Thread pool orchestration, JSON serialization, Kafka producer |
+| MongoDB | ~15-20% | ~3M total ops (lookups + updates + throttle checks) |
+| 4× MOO SOR JVMs | ~20-24% total (~5-6% each) | Thread pool orchestration, JSON serialization, Kafka producer |
 | Kafka | ~5-10% | 1.2M messages, LZ4 compression, log writes |
 | Other (Zookeeper, mock market data, OS) | ~5% | Minimal |
 
@@ -1955,13 +2197,15 @@ moo-sor-alert-service/
 │   │   └── FactSetWebhookController.java     POST /api/v1/alerts/factset/webhook
 │   ├── service/
 │   │   ├── CustomerDataService.java          DB abstraction interface (findByUserId, updateDateDelivered)
-│   │   ├── MongoCustomerDataService.java     MongoDB implementation (@Profile("!oracle"))
+│   │   ├── MongoCustomerDataService.java     MongoDB embedded impl (@Profile("!oracle & !mongo-flat"))
+│   │   ├── MongoFlatCustomerDataService.java MongoDB flat impl (@Profile("mongo-flat"))
 │   │   ├── OracleCustomerDataService.java    Oracle JPA implementation (@Profile("oracle"))
 │   │   ├── MOOAlertOrchestrationService.java Core orchestration (lookup → validate → enrich → publish)
 │   │   └── MarketDataClient.java             REST client + Caffeine cache
 │   ├── model/
 │   │   ├── FactSetAlert.java                 Inbound webhook payload
-│   │   ├── CustomerDocument.java             Domain model (shared by both DB implementations)
+│   │   ├── CustomerDocument.java             Domain model (shared by all DB implementations)
+│   │   ├── FlatAlertDocument.java            Flat MongoDB document (1 per subscription, denormalized)
 │   │   ├── Subscription.java                 Subscription domain object
 │   │   ├── ChannelPreference.java            Contact channel (push/email/sms)
 │   │   ├── ContactPreferences.java           Channel list wrapper
@@ -1972,17 +2216,20 @@ moo-sor-alert-service/
 │   │       ├── SubscriptionEntity.java       CUSTOMER_SUBSCRIPTIONS table entity
 │   │       └── ChannelPreferenceEntity.java  CHANNEL_PREFERENCES table entity
 │   └── repository/
-│       ├── CustomerRepository.java           Spring Data MongoDB repository (@Profile("!oracle"))
+│       ├── CustomerRepository.java           Spring Data MongoDB repo (@Profile("!oracle & !mongo-flat"))
+│       ├── FlatAlertRepository.java          Flat MongoDB repo (@Profile("mongo-flat"))
 │       ├── OracleCustomerRepository.java     Spring Data JPA repository (@Profile("oracle"))
 │       └── OracleSubscriptionRepository.java JPA repo with updateDateDelivered query (@Profile("oracle"))
 ├── src/main/resources/
-│   ├── application.yml                       All configuration (default + oracle profile)
+│   ├── application.yml                       All configuration (default + mongo-flat + oracle profiles)
 │   └── schema-oracle.sql                     Oracle DDL (tables + indexes)
 ├── src/test/java/com/bank/moo/
 │   ├── load/
-│   │   ├── TestDataGenerator.java            Seeds 500K customers into MongoDB
+│   │   ├── TestDataGenerator.java            Seeds 500K customers into MongoDB (embedded model)
+│   │   ├── FlatMongoTestDataGenerator.java   Seeds ~2.5M alert docs into MongoDB (flat model)
 │   │   ├── OracleTestDataGenerator.java      Seeds 500K customers into Oracle (3 tables)
-│   │   ├── MarketCrashLoadTest.java          2M webhook load test (MongoDB)
+│   │   ├── MarketCrashLoadTest.java          2M webhook load test (MongoDB embedded)
+│   │   ├── FlatMongoMarketCrashLoadTest.java 2M webhook load test (MongoDB flat)
 │   │   ├── OracleMarketCrashLoadTest.java    2M webhook load test (Oracle)
 │   │   ├── CircuitBreakerDegradationTest.java 200K degradation test
 │   │   ├── LoadTestScenarios.java            All scenario definitions
@@ -1994,9 +2241,10 @@ moo-sor-alert-service/
 │       └── MockMarketDataServer.java         Embedded HTTP server for unit tests
 ├── mock-market-data/                         Standalone Spring Boot mock (Docker)
 ├── docker-compose.yml                        Full environment (MongoDB, Kafka, Oracle, 4 instances)
+├── docker-compose-mongo-flat.yml             Override: switches instances to mongo-flat profile
 ├── docker-compose-oracle.yml                 Override: switches instances to oracle profile
 ├── Dockerfile                                Multi-stage build
-└── build.gradle                              Dependencies, test config, seedOracle/oracleLoadTest tasks
+└── build.gradle                              Dependencies, test config, seed*/load* tasks
 ```
 
 ## Metrics (Micrometer)
